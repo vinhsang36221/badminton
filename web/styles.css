@@ -1,0 +1,183 @@
+body { font-size: 14px; }
+.card-player { min-width: 120px; }
+.court-card { margin-bottom: 12px; }
+/* Show courts in reverse DOM order so Sân 12 appears on top */
+#courtsRow { display:flex; flex-direction: column-reverse; }
+/* Ensure the VS column is fixed width and vertically centered across all courts */
+.vs-col { flex: 0 0 60px; width: 60px; display: flex; align-items: center; justify-content: center; }
+/* Use grid so the three main frames (Team A / VS / Team B) have equal widths across courts */
+.card-body { display: grid; grid-template-columns: 1fr 1fr 1fr auto; align-items: center; gap: 8px; }
+/* Team column becomes a small framed area: two player slots centered */
+.team-col {
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	overflow: hidden;
+}
+/* inner row to hold two player name slots (left/right inside team box) */
+.team-row{ display:flex; gap:8px; align-items:center; justify-content:center; width:100%; }
+.team-row .player-name{ display:inline-block; max-width: calc(50% - 6px); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.team-row .sep{ padding:0 6px; color:rgba(0,0,0,0.6); }
+.enter-col { grid-column: 4; }
+
+/* Empty slot that spans the three team columns and centers its text */
+.empty-slot{ grid-column: 1 / 4; display:flex; align-items:center; justify-content:center; min-height:56px; font-size:20px; color:rgba(0,0,0,0.7); }
+
+#idlePlayers .badge { cursor: default; }
+
+/* Uniform button look used across the app */
+.uniform-btn {
+	/* default: neutral gray for generic buttons */
+	background-color: #6c757d !important;
+	color: #fff !important;
+	border: none !important;
+}
+.uniform-btn.btn-outline-secondary, .uniform-btn.btn-outline-primary, .uniform-btn.btn-outline-danger, .uniform-btn.btn-outline-success, .uniform-btn.btn-outline-dark {
+	background-color: #6c757d !important;
+	color: #fff !important;
+	border: none !important;
+}
+
+/* Semantic button colors */
+.btn-male { background-color: #cfe3ff !important; color: #000 !important; }
+.btn-female { background-color: #ffd6ec !important; color: #000 !important; }
+.btn-level { background-color: #fdcc3a !important; color: #000 !important; }
+.btn-enter-score { background-color: #28a745 !important; color: #fff !important; }
+
+/* Prefer states */
+.prefer-chill { background-color: #c8facc !important; color: #064e14 !important; }
+.prefer-normal { background-color: #fff3bf !important; color: #614700 !important; }
+.prefer-challenge { background-color: #ffb3b3 !important; color: #600000 !important; }
+
+/* Admin player list alignment */
+.admin-row{ display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 6px; }
+.admin-left{ display:flex; align-items:center; gap:4px; min-width:90px; flex: 1 1 auto; }
+.admin-edit{ display:flex; align-items:center; justify-content:center; flex: 0 0 60px; }
+.admin-right{ display:flex; align-items:center; gap:6px; flex: 0 0 auto; }
+.admin-right .btn{ min-width:48px; }
+/* Ensure admin-right buttons have exact widths matching header spans */
+.admin-right .gender-btn{ width:96px !important; }
+.admin-right .btn-level{ width:48px !important; }
+.admin-right .btn-ready, .admin-right .btn-notready{ width:48px !important; }
+.admin-right .prefer-btn{ width:96px !important; }
+.admin-right .btn-single, .admin-right .btn-info{ width:72px !important; }
+.admin-right .btn-delete{ width:56px !important; }
+.admin-right .btn-uncouple{ width:72px !important; }
+
+/* controls placed at top-right of Players admin to free player-area space */
+.admin-top-controls{ display:flex; gap:8px; align-items:center; }
+.admin-top-controls .btn{ height:32px; }
+
+.admin-panel{ background:#fff; border:1px solid #e3e3e3; padding:12px; border-radius:6px; display:flex; flex-direction:column; height:100%; }
+.admin-panel .panel-body{ flex:1 1 auto; overflow:auto; }
+
+/* For panels where scrolling isn't desired (e.g., Add Player) */
+.admin-panel--no-scroll { height: auto; max-width: none; width: 111%; }
+.admin-panel--no-scroll .panel-body { overflow: visible; }
+
+/* Keep the Add button compact and flush with the adjacent select */
+.admin-panel .panel-body .col-auto .btn { white-space: nowrap; padding-left: 10px; padding-right: 10px; }
+
+/* ensure admin row's columns stretch to equal height by default */
+.tab-pane > .row{ align-items: stretch; }
+
+/* Opt-out class: prevent a specific row from stretching (lets panels auto-size) */
+.no-stretch-row { align-items: flex-start; }
+
+/* Add Player form: distribute controls and keep Add button flush-right */
+.add-player-form{ display:flex; align-items:center; justify-content:space-between; gap:6px; flex-wrap:nowrap; }
+.add-player-form .fp-name{ flex: 0 0 23%; }
+.add-player-form .fp-level{ flex: 0 0 23%; }
+.add-player-form .fp-gender{ flex: 0 0 23%; }
+.add-player-form .fp-prefer{ flex: 0 0 23%; }
+.add-player-form .fp-add{ flex: 0 0 auto; display:flex; justify-content:flex-end; }
+.add-player-form .fp-add{ margin-left: auto; }
+.add-player-form .fp-add{ flex: 0 0 auto; }
+.add-player-form .form-control, .add-player-form .form-select{ width:100%; }
+
+/* Compact right panel that should not stretch to full column height */
+.admin-panel--compact{ padding:8px; display:inline-flex; align-items:center; height:auto; }
+.admin-compact-col{ align-self:flex-start; }
+
+.btn-uncouple{ background-color: #dc3545 !important; color: #fff !important; border: none !important; }
+
+/* Wish button equal width */
+.wish-btn{ display:inline-flex; justify-content:center; align-items:center; min-width:70px; transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease; }
+/* less prominent when not selected */
+.wish-btn.btn-outline-secondary{ opacity: 0.75; }
+/* Selected styles per preference */
+.wish-btn.wish-selected-chill{ background-color: #28a745 !important; color: #fff !important; box-shadow: 0 8px 22px rgba(40,167,69,0.12), 0 0 0 3px rgba(40,167,69,0.08); transform: translateY(-2px); border: 1px solid rgba(40,167,69,0.9) !important; }
+.wish-btn.wish-selected-normal{ background-color: #fdcc3a !important; color: #000 !important; box-shadow: 0 8px 22px rgba(253,204,58,0.12), 0 0 0 3px rgba(253,204,58,0.08); transform: translateY(-2px); border: 1px solid rgba(253,204,58,0.9) !important; }
+.wish-btn.wish-selected-challenge{ background-color: #ff6b6b !important; color: #fff !important; box-shadow: 0 8px 22px rgba(255,107,107,0.12), 0 0 0 3px rgba(255,107,107,0.08); transform: translateY(-2px); border: 1px solid rgba(255,107,107,0.9) !important; }
+.wish-btn:focus{ outline: none; }
+
+/* Prefer toggle in admin list: keep fixed width to avoid shifting */
+.prefer-btn{ display:inline-flex; justify-content:center; align-items:center; width:96px !important; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+/* Gender button fixed width to avoid layout shift when toggling */
+.gender-btn{ display:inline-flex; justify-content:center; align-items:center; width:96px !important; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+/* make admin player rows responsive on small screens to avoid overlap */
+@media (max-width: 767.98px){
+	.admin-row{ flex-direction:column; align-items:flex-start; padding:4px 4px; }
+	.admin-left{ min-width:0; margin-bottom:6px; }
+	.admin-right{ width:100%; display:flex; flex-wrap:wrap; gap:6px; }
+	.admin-right .btn{ min-width:0; flex: 1 1 auto; }
+	/* prefer button should still visually align but allow wrapping */
+	.prefer-btn{ width:auto !important; min-width:72px; }
+	.gender-btn{ width:auto !important; min-width:72px; }
+	/* ensure admin panels stack and scroll nicely */
+	#adminPlayerList{ max-height:320px; overflow:auto; }
+	#adminHistoryBox, #logPreview{ max-height:200px; overflow:auto; }
+}
+
+/* Use normal font-weight for player-area buttons */
+#adminPlayerList .admin-right .btn { font-weight: 400 !important; box-shadow: none; }
+
+/* Ready / Not ready button styles (pale tones, consistent with other player buttons) */
+.btn-ready { background-color: #28a745 !important; color: #fff !important; }
+.btn-notready { background-color: #dc3545 !important; color: #fff !important; }
+
+/* Delete button style aligned with uniform buttons but slightly muted */
+.btn-delete { background-color: #6c757d !important; color: #fff !important; }
+
+/* Single button: neutral background but black text */
+.btn-single { background-color: #0dcaf0 !important; color: hsl(0, 0%, 100%) !important; border: none !important; }
+
+/* Gender button text should be normal weight and black (override background color text setting) */
+.gender-btn { font-weight: 400 !important; color: #000 !important; }
+
+/* Exception: Prefer button should show full semantic color like Wishes */
+#adminPlayerList .admin-right .prefer-btn { filter: none !important; }
+
+/* Court label and player name emphasis */
+.court-card .card-header { font-weight: 700 !important; }
+.court-card .team-col { font-weight: 700 !important; font-size: 34px !important; }
+
+/* player name color by gender (use same background colors as button variants) */
+.player-name.male { color: #0f57b7 !important; }
+.player-name.female { color: #b23a7a !important; }
+
+/* Partner select styled to match other admin buttons */
+.partner-btn {
+	width: 140px !important;
+	min-width: 100px !important;
+	height: 32px !important;
+	background-color: #0d6efd !important;
+	color: #fff !important;
+	border: none !important;
+	padding: 0.25rem 0.5rem !important;
+	border-radius: 4px !important;
+	font-weight: 400 !important;
+	box-shadow: none !important;
+	white-space: nowrap !important;
+	overflow: hidden !important;
+	text-overflow: ellipsis !important;
+}
+.partner-btn:focus{ outline: none !important; box-shadow: none !important; }
+
+@media (max-width: 767.98px){
+	.partner-btn{ width: auto !important; min-width:72px; }
+}

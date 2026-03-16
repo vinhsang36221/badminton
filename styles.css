@@ -178,6 +178,11 @@ body { font-size: 14px; }
 }
 .partner-btn:focus{ outline: none !important; box-shadow: none !important; }
 
+/* Slightly increase court font/space when layout gives it more width */
+@media (min-width: 768px){
+	.court-card .team-col { font-size: 36px !important; }
+}
+
 @media (max-width: 767.98px){
 	.partner-btn{ width: auto !important; min-width:72px; }
 }

@@ -48,6 +48,7 @@ players.forEach(p=>{
 let active_matches = [];
 let queue_matches = [];
 let idle_players = [];
+let idleSeq = 0; // increasing counter to assign idle order (smaller = older)
 const MAX_COUPLE = 5;
 
 // utilities
@@ -58,9 +59,12 @@ function partner_penalty(team){
   return (partner_history[key]||0) * 200;
 }
 
-function renderPlayerSpan(p){
+function renderPlayerSpan(p, loc){
   const cls = (p && p.gender === 'female') ? 'female' : 'male';
-  return `<span class="player-name ${cls}">${p.name}</span>`;
+  const name = p ? p.name : '';
+  const dataLoc = loc ? ` data-loc="${loc}"` : '';
+  // inline handlers ensure handlers exist even before JS attaches listeners
+  return `<span class="player-name ${cls}" draggable="true" ${dataLoc} ondragstart="onPlayerDragStart(event)" ondragover="onPlayerDragOver(event)" ondrop="onPlayerDrop(event)">${name}</span>`;
 }
 function prefer_penalty(team){
   let penalty = 0;
@@ -77,6 +81,103 @@ function team_type(team){
   if(males === 2) return 'MM';
   if(females === 2) return 'FF';
   return 'MF';
+}
+
+// Drag & Drop helpers
+function onPlayerDragStart(e){
+  const loc = e.target.getAttribute('data-loc');
+  if(!loc) return;
+  e.dataTransfer.setData('text/plain', loc);
+}
+function onPlayerDragOver(e){ e.preventDefault(); }
+function onPlayerDrop(e){
+  e.preventDefault();
+  const src = e.dataTransfer.getData('text/plain');
+  const dst = e.target.getAttribute('data-loc');
+  if(!src || !dst) return;
+  try{ performSwap(src, dst); }catch(err){ console.error('drop swap failed', err); }
+}
+
+function getPlayerAtLoc(loc){
+  const parts = loc.split(':');
+  if(parts[0] === 'court'){
+    if(parts[2] === 'empty') return null;
+    const ci = parseInt(parts[1],10); const team = parseInt(parts[2],10); const pos = parseInt(parts[3],10);
+    const m = active_matches[ci]; if(!m) return null; return m[team][pos];
+  }
+  if(parts[0] === 'queue'){
+    const qi = parseInt(parts[1],10); const team = parseInt(parts[2],10); const pos = parseInt(parts[3],10);
+    const m = queue_matches[qi]; if(!m) return null; return m[team][pos];
+  }
+  if(parts[0] === 'idle'){
+    const ii = parseInt(parts[1],10); return idle_players[ii] || null;
+  }
+  return null;
+}
+
+function setPlayerAtLoc(loc, player){
+  const parts = loc.split(':');
+  if(parts[0] === 'court'){
+    if(parts[2] === 'empty'){
+      const ci = parseInt(parts[1],10); // place first empty court slot as a whole match? but here we'll not support filling empty with team position
+      return; // no-op
+    }
+    const ci = parseInt(parts[1],10); const team = parseInt(parts[2],10); const pos = parseInt(parts[3],10);
+    if(!active_matches[ci]) active_matches[ci] = [[null,null],[null,null]];
+    active_matches[ci][team][pos] = player;
+    return;
+  }
+  if(parts[0] === 'queue'){
+    const qi = parseInt(parts[1],10); const team = parseInt(parts[2],10); const pos = parseInt(parts[3],10);
+    if(!queue_matches[qi]) return; queue_matches[qi][team][pos] = player; return;
+  }
+  if(parts[0] === 'idle'){
+    const ii = parseInt(parts[1],10);
+    if(player === null){ // remove
+      const idx = idle_players.findIndex(x=> x && x.name === (player && player.name)); if(idx!==-1) idle_players.splice(idx,1);
+      return;
+    }
+    // replace at index if exists, else push
+    if(ii >= 0 && ii < idle_players.length) idle_players[ii] = player; else idle_players.push(player);
+    return;
+  }
+}
+
+function removePlayerFromLocation(loc){
+  const parts = loc.split(':');
+  if(parts[0] === 'court'){
+    if(parts[2] === 'empty') return null;
+    const ci = parseInt(parts[1],10); const team = parseInt(parts[2],10); const pos = parseInt(parts[3],10);
+    if(!active_matches[ci]) return null; const p = active_matches[ci][team][pos]; active_matches[ci][team][pos] = null; return p;
+  }
+  if(parts[0] === 'queue'){
+    const qi = parseInt(parts[1],10); const team = parseInt(parts[2],10); const pos = parseInt(parts[3],10);
+    if(!queue_matches[qi]) return null; const p = queue_matches[qi][team][pos]; queue_matches[qi][team][pos] = null; return p;
+  }
+  if(parts[0] === 'idle'){
+    const ii = parseInt(parts[1],10); if(ii<0 || ii>=idle_players.length) return null; const p = idle_players.splice(ii,1)[0]; return p;
+  }
+  return null;
+}
+
+function performSwap(srcLoc, dstLoc){
+  if(srcLoc === dstLoc) return;
+  const srcPlayer = getPlayerAtLoc(srcLoc);
+  const dstPlayer = getPlayerAtLoc(dstLoc);
+  // remove both from their locations
+  removePlayerFromLocation(srcLoc);
+  removePlayerFromLocation(dstLoc);
+  // set swapped
+  if(dstPlayer) setPlayerAtLoc(srcLoc, dstPlayer); else {
+    // if dst was empty, set srcLoc to null already removed
+  }
+  if(srcPlayer) setPlayerAtLoc(dstLoc, srcPlayer);
+  // Cleanup: remove any null-only matches in queue (if a whole queued match has nulls, rebuild that match)
+  queue_matches = queue_matches.filter(m=> m && m.flat().every(p=> p));
+  // normalize active matches length
+  while(active_matches.length < COURTS) active_matches.push(null);
+  saveState(); updateIdlePlayers(); render(); renderAdminPlayers();
+  logLine(`dragSwap: src=${srcLoc} dst=${dstLoc} resultActive=${JSON.stringify(active_matches.map(m=> m? m.flat().map(p=>p? p.name:null): null))} queue=${JSON.stringify(queue_matches.map(m=> m? m.flat().map(p=>p? p.name:null): null))} idle=${JSON.stringify(idle_players.map(p=>p.name))}`);
 }
 
 function best_match(group, allowCrossType=false){
@@ -103,14 +204,8 @@ function best_match(group, allowCrossType=false){
     if(conflictUncouple) continue;
     if(!t1[0] || !t1[1] || !t2[0] || !t2[1]) continue;
     const tt1 = team_type(t1), tt2 = team_type(t2);
-    // reject any female-only teams: only MM or MF (mixed) are allowed
-    if(tt1 === 'FF' || tt2 === 'FF') continue;
-    if(tt1 !== tt2){
-      if(!allowCrossType) continue; // not allowed to mix types unless pool permits
-      // allow cross-type only for MM vs MF (others shouldn't happen)
-      const okMix = ( (tt1==='MM' && tt2==='MF') || (tt1==='MF' && tt2==='MM') );
-      if(!okMix) continue;
-    }
+    // require both teams to be of the same type (MM-MM, MF-MF, or FF-FF)
+    if(tt1 !== tt2) continue;
     // additional rule: if both are mixed teams (MF vs MF), ensure the two male players' levels differ by at most 1
     if(tt1 === 'MF' && tt2 === 'MF'){
       const male1 = t1.find(p=>p && p.gender === 'male');
@@ -126,12 +221,13 @@ function best_match(group, allowCrossType=false){
     if(t2[0].couple && t2[0].couple === t2[1].couple) score -= 150;
     if(score < bestScore){ bestScore = score; best = m; }
   }
+  if(best) best._score = bestScore;
   return best;
 }
 
-function create_matches(){
-  // only consider players who are marked ready and not waiting for a partner
-  let readyPlayers = players.filter(p=>{
+function create_matches(candidatePlayers){
+  // Construct list of ready players. If candidatePlayers is provided, use it (array of player objects).
+  let readyPlayers = (candidatePlayers && Array.isArray(candidatePlayers)) ? candidatePlayers.slice() : players.filter(p=>{
     if(!p.ready) return false;
     if(p.wait_for_partner) return false;
     if(p.couple){
@@ -140,78 +236,116 @@ function create_matches(){
     }
     return true;
   });
-  let players_sorted = [...readyPlayers].sort((a,b)=> (a.matches-b.matches)|| (b.wait-a.wait));
-  let pool = players_sorted.slice();
-  for(let i=pool.length-1;i>0;i--){ let j=Math.floor(Math.random()*(i+1)); [pool[i],pool[j]]=[pool[j],pool[i]]; }
-  let matches=[];
+  // Sort by matches ascending then by wait descending
+  let pool = [...readyPlayers].sort((a,b)=> (a.matches - b.matches) || ((b.wait||0) - (a.wait||0)) );
+  let matches = [];
 
-  // whether to allow MM vs MF mixing: only when number of females in pool is odd
-  const femaleCount = pool.filter(p=>p.gender === 'female').length;
-  const allowCrossType = (femaleCount % 2 === 1);
+  // helper to remove a match's players from pool
+  function removeFromPool(match){
+    match.flat().forEach(p=>{
+      const idx = pool.findIndex(x=> x.name === p.name);
+      if(idx !== -1) pool.splice(idx,1);
+    });
+  }
 
-  // Priority: try to form matches that keep couple pairs together first
-  // Find couple ids that have at least two players in pool
-  const coupleMap = {};
-  pool.forEach(p=>{ if(p.couple){ coupleMap[p.couple] = coupleMap[p.couple] || []; coupleMap[p.couple].push(p); } });
-  for(const cid in coupleMap){
-    const arr = coupleMap[cid];
-    if(arr.length >= 2){
-      // attempt to form as many matches as possible using these pairs
-      while(arr.length >= 2){
-        const couplePair = [arr.shift(), arr.shift()];
-        // ensure both still in pool
-        if(!pool.includes(couplePair[0]) || !pool.includes(couplePair[1])) continue;
-        // try to pick two other players and validate via best_match (enforces team rules)
-        let formed = false;
-        for(let attempt=0; attempt<200 && !formed; attempt++){
-          const others = pool.filter(p=> p!==couplePair[0] && p!==couplePair[1]);
-          if(others.length < 2) break;
-          // pick two random others
-          let copy = others.slice();
-          let j1 = Math.floor(Math.random()*copy.length); const o1 = copy.splice(j1,1)[0];
-          let j2 = Math.floor(Math.random()*copy.length); const o2 = copy.splice(j2,1)[0];
-          // use best_match to validate the 4-player grouping and respect MF male-level rule
-          const candidate = best_match([couplePair[0], couplePair[1], o1, o2], allowCrossType);
-          if(!candidate) continue;
-          // ensure the couplePair are kept together as one team in the returned pairing
-          const teamContainsCouple = (team)=> (team[0] && team[1] && ((team[0].name===couplePair[0].name && team[1].name===couplePair[1].name) || (team[0].name===couplePair[1].name && team[1].name===couplePair[0].name)));
-          if(!teamContainsCouple(candidate[0]) && !teamContainsCouple(candidate[1])) continue;
-          // accept this match
-          matches.push(candidate);
-          // remove used players from pool
-          candidate[0].forEach(p=>{ const idx = pool.indexOf(p); if(idx!==-1) pool.splice(idx,1); });
-          candidate[1].forEach(p=>{ const idx = pool.indexOf(p); if(idx!==-1) pool.splice(idx,1); });
-          // also remove from arr any players no longer in pool
-          for(let ii=arr.length-1; ii>=0; ii--){ if(!pool.includes(arr[ii])) arr.splice(ii,1); }
-          formed = true;
+  // Priority 1: try to form matches that include highest-wait players (use pool sorted by wait)
+  const poolByWait = pool.slice().sort((a,b)=> (b.wait||0) - (a.wait||0));
+  for(let s=0; s<Math.min(poolByWait.length, 6); s++){
+    const seed = poolByWait[s];
+    if(!pool.some(p=> p.name === seed.name)) continue;
+    const others = pool.filter(p=> p.name !== seed.name);
+    if(others.length < 3) continue;
+    // try combinations of 3 others; prefer forming MF-MF first, then fallback
+    let seedUsed = false;
+    let bestMF = null; let bestMFScore = 1e12;
+    let bestAny = null; let bestAnyScore = 1e12;
+    for(let i=0;i<others.length;i++){
+      for(let j=i+1;j<others.length;j++){
+        for(let k=j+1;k<others.length;k++){
+          const group = [seed, others[i], others[j], others[k]];
+          const femaleCount = group.filter(p=> p.gender==='female').length;
+          const allowCross = (femaleCount % 2 === 1);
+          const m = best_match(group, allowCross);
+          if(!m) continue;
+          const sc = (m._score !== undefined) ? m._score : 0;
+          const t0 = team_type(m[0]);
+          if(t0 === 'MF'){
+            if(sc < bestMFScore){ bestMFScore = sc; bestMF = m; }
+          }
+          if(sc < bestAnyScore){ bestAnyScore = sc; bestAny = m; }
         }
       }
     }
+    if(bestMF){ matches.push(bestMF); removeFromPool(bestMF); seedUsed = true; }
+    else if(bestAny){ matches.push(bestAny); removeFromPool(bestAny); seedUsed = true; }
+    if(seedUsed) continue;
   }
 
-  // Try to form groups of 4 that yield same-type match (MM vs MM or MF vs MF)
-  while(pool.length >=4){
-    let found = false;
-      for(let k=0;k<200;k++){
-      let group = [];
-      let copy = pool.slice();
-      for(let i=0;i<4;i++){ let j=Math.floor(Math.random()*copy.length); group.push(copy.splice(j,1)[0]); }
-      let m = best_match(group, allowCrossType);
-      if(m){
-        matches.push(m);
-        // remove used players from pool
-        m[0].forEach(p=>{ let idx = pool.indexOf(p); if(idx!=-1) pool.splice(idx,1); });
-        m[1].forEach(p=>{ let idx = pool.indexOf(p); if(idx!=-1) pool.splice(idx,1); });
-        found = true; break;
+  function findBestGroup(requireType){
+    let bestGroup = null; let bestGroupScore = 1e12;
+    const n = pool.length;
+    const femaleCount = pool.filter(p=>p.gender === 'female').length;
+    const allowCrossType = (femaleCount % 2 === 1);
+    for(let i=0;i<n-3;i++){
+      for(let j=i+1;j<n-2;j++){
+        for(let k=j+1;k<n-1;k++){
+          for(let l=k+1;l<n;l++){
+            const group = [pool[i], pool[j], pool[k], pool[l]];
+            const m = best_match(group, allowCrossType);
+            if(!m) continue;
+            const t0 = team_type(m[0]);
+            if(requireType && t0 !== requireType) continue;
+            const sc = (m._score !== undefined) ? m._score : 0;
+            if(sc < bestGroupScore){ bestGroupScore = sc; bestGroup = {m, indices:[i,j,k,l]}; }
+          }
+        }
       }
     }
-    if(!found) break; // cannot form more constrained matches
+    return bestGroup;
   }
-  return matches;
+
+  // Greedy exhaustive selection: prefer MF-MF first, then best overall
+  while(pool.length >= 4){
+    let bestGroup = findBestGroup('MF');
+    if(!bestGroup) bestGroup = findBestGroup(null);
+    if(!bestGroup) break;
+    matches.push(bestGroup.m);
+    const rem = bestGroup.indices.sort((a,b)=> b-a);
+    rem.forEach(idx=> pool.splice(idx,1));
+  }
+  // filter out any matches that share players (keep first occurrence)
+  const finalMatches = [];
+  const usedNames = new Set();
+  for(const m of matches){
+    if(!m) continue;
+    const names = m.flat().map(p=>p.name);
+    if(names.some(n=> usedNames.has(n))) continue;
+    finalMatches.push(m);
+    names.forEach(n=> usedNames.add(n));
+  }
+  return finalMatches;
 }
 
 function initialize(){
+  // initial full-match generation
   let matches = create_matches();
+  // attempt to further exhaust idle players into queued matches so we only keep idle < 4 when possible
+  let usedNames = new Set([].concat(...matches.map(m=>[].concat(...m))).map(p=> p ? p.name : null).filter(n=> n));
+  while(true){
+    const idleCandidates = players.filter(p=> p.ready && !usedNames.has(p.name));
+    if(idleCandidates.length < 4) break;
+    const more = create_matches(idleCandidates);
+    if(!more || more.length === 0) break;
+    let addedAny = false;
+    for(const nm of more){
+      const names = nm.flat().map(p=> p ? p.name : null).filter(n=> n);
+      if(names.some(n=> usedNames.has(n))) continue;
+      matches.push(nm);
+      names.forEach(n=> usedNames.add(n));
+      addedAny = true;
+    }
+    if(!addedAny) break;
+  }
   let playing = Math.min(COURTS, matches.length);
   active_matches = matches.slice(0,playing);
   queue_matches = matches.slice(playing);
@@ -222,6 +356,9 @@ function initialize(){
   let used = [].concat(...matches.map(m=>[].concat(...m)));
   // idle players are those not used and marked ready
   idle_players = players.filter(p=> p.ready && !used.includes(p));
+  // clear idleOrder for players assigned to matches
+  normalizeIdleOrders();
+  logLine(`buildMatches: active=${JSON.stringify(active_matches.map(m=> m? m.flat().map(p=>p.name): null))} queue=${JSON.stringify(queue_matches.map(m=> m? m.flat().map(p=>p.name): null))} idle=${JSON.stringify(idle_players.map(p=>p.name))}`);
 }
 
 // rendering
@@ -243,8 +380,8 @@ function populateWishLists(){
   sel.innerHTML = '';
   partner.innerHTML = '';
   // add placeholder options
-  const ph1 = document.createElement('option'); ph1.value = ''; ph1.textContent = 'Chọn tên của bạn'; ph1.disabled = true; ph1.selected = true; sel.appendChild(ph1);
-  const ph2 = document.createElement('option'); ph2.value = ''; ph2.textContent = 'Chọn tên Partner bạn mong muốn'; ph2.disabled = true; ph2.selected = true; partner.appendChild(ph2);
+  const ph1 = document.createElement('option'); ph1.value = ''; ph1.textContent = 'Chọn Tên Bạn'; ph1.disabled = true; ph1.selected = true; sel.appendChild(ph1);
+  const ph2 = document.createElement('option'); ph2.value = ''; ph2.textContent = 'Chọn Tên Partner Của Bạn'; ph2.disabled = true; ph2.selected = true; partner.appendChild(ph2);
   players.forEach((p,idx)=>{
     const o = document.createElement('option'); o.value = String(idx); o.textContent = p.name; sel.appendChild(o);
     const o2 = document.createElement('option'); o2.value = String(idx); o2.textContent = p.name; partner.appendChild(o2);
@@ -370,12 +507,11 @@ function renderCourt(i){
     html = `<div class="card">
       <div class="card-header position-relative">
         <div class="w-100 text-center fs-5 fw-bold">Sân ${10 + i}</div>
-        <div style="position:absolute; right:0.5rem; top:50%; transform:translateY(-50%);"><button class="btn btn-sm btn-edit-match" data-edit-court="${i}">Edit</button></div>
       </div>
       <div class="card-body d-flex align-items-center">
-        <div class="team-col text-center flex-fill"><div class="team-row">${renderPlayerSpan(t1[0])}<span class="sep">-</span>${renderPlayerSpan(t1[1])}</div></div>
+        <div class="team-col text-center flex-fill"><div class="team-row">${renderPlayerSpan(t1[0], 'court:'+i+':0:0')}<span class="sep">-</span>${renderPlayerSpan(t1[1], 'court:'+i+':0:1')}</div></div>
         <div class="vs-col text-center px-2"><strong>VS</strong></div>
-        <div class="team-col text-center flex-fill"><div class="team-row">${renderPlayerSpan(t2[0])}<span class="sep">-</span>${renderPlayerSpan(t2[1])}</div></div>
+        <div class="team-col text-center flex-fill"><div class="team-row">${renderPlayerSpan(t2[0], 'court:'+i+':1:0')}<span class="sep">-</span>${renderPlayerSpan(t2[1], 'court:'+i+':1:1')}</div></div>
         <div class="enter-col ms-2"><button class="btn btn-sm btn-enter-score" data-court="${i}">Enter score</button></div>
       </div>
     </div>`;
@@ -383,32 +519,34 @@ function renderCourt(i){
     html = `<div class="card">
         <div class="card-header position-relative"><div class="w-100 text-center fs-5 fw-bold">Sân ${10 + i}</div><div style="position:absolute; right:0.5rem; top:50%; transform:translateY(-50%);"><button class="btn btn-sm btn-edit-match" data-edit-court="${i}">Edit</button></div></div>
         <div class="card-body">
-          <div class="empty-slot">Empty</div>
+          <div class="empty-slot" data-loc="court:${i}:empty" ondragover="onPlayerDragOver(event)" ondrop="onPlayerDrop(event)">Empty</div>
         </div>
       </div>`;
   }
   card.innerHTML = html;
   const btn = card.querySelector('button[data-court]'); if(btn) btn.onclick = ()=> openScoreModal(i);
-  const editBtn = card.querySelector('button[data-edit-court]'); if(editBtn) editBtn.onclick = ()=> openEditModal(i);
 }
 
 function renderQueue(){
   const queueList = document.getElementById('queueList'); queueList.innerHTML='';
-  queue_matches.forEach(m=>{
+  for(let qi=0; qi<queue_matches.length; qi++){
+    const m = queue_matches[qi]; if(!m) continue;
     let [t1,t2]=m;
     let li=document.createElement('li'); li.className='list-group-item';
-    li.innerHTML = `${renderPlayerSpan(t1[0])} - ${renderPlayerSpan(t1[1])} &nbsp;&nbsp; vs &nbsp;&nbsp; ${renderPlayerSpan(t2[0])} - ${renderPlayerSpan(t2[1])}`;
+    li.innerHTML = `${renderPlayerSpan(t1[0], 'queue:'+qi+':0:0')} - ${renderPlayerSpan(t1[1], 'queue:'+qi+':0:1')} &nbsp;&nbsp; vs &nbsp;&nbsp; ${renderPlayerSpan(t2[0], 'queue:'+qi+':1:0')} - ${renderPlayerSpan(t2[1], 'queue:'+qi+':1:1')}`;
     queueList.appendChild(li);
-  });
+  }
 }
 
 function renderIdle(){
   const idleBox = document.getElementById('idlePlayers'); idleBox.innerHTML='';
-  // Render as a list-group (like queue) and join names with ' - '
+  // Render each idle player as a draggable span so we can swap with courts/queue
   const ul = document.createElement('ul'); ul.className = 'list-group';
-  const li = document.createElement('li'); li.className = 'list-group-item';
-  li.innerHTML = idle_players.map(p=>`<span class="player-name ${p.gender==='female'?'female':'male'}">${p.name}</span>`).join(' - ');
-  ul.appendChild(li);
+  idle_players.forEach((p, idx)=>{
+    const li = document.createElement('li'); li.className = 'list-group-item';
+    li.innerHTML = `${renderPlayerSpan(p, 'idle:'+idx)}`;
+    ul.appendChild(li);
+  });
   idleBox.appendChild(ul);
 }
 
@@ -467,6 +605,7 @@ function saveEditMatch(){
   const match = active_matches[idx];
   if(!match){ return alert('No active match on this court'); }
   const currentPlayers = match.flat().map(p=> p ? p.name : '');
+  logLine(`editMatch: court=${idx} selNames=${JSON.stringify(selNames)} currentPlayers=${JSON.stringify(currentPlayers)}`);
   // validation: ensure selected names are unique
   const unique = new Set(selNames);
   if(unique.size !== selNames.length){ return alert('Please ensure each slot has a distinct player'); }
@@ -489,27 +628,82 @@ function saveEditMatch(){
     const names = m.flat().map(p=> p ? p.name : '');
     for(const selName of selNames){ if(selName && names.includes(selName)){ queueIndicesToRemove.add(qi); } }
   }
+  console.log('saveEditMatch: selNames=', selNames);
+  console.log('saveEditMatch: initial queue_matches=', queue_matches.map(m=> m? m.flat().map(p=>p.name): null));
+  logLine(`editMatch:start selNames=${JSON.stringify(selNames)} initialQueue=${JSON.stringify(queue_matches.map(m=> m? m.flat().map(p=>p.name): null))}`);
   if(queueIndicesToRemove.size > 0){
     // compute current max wait to boost priority
     const maxWait = Math.max(0, ...players.map(p=> p.wait || 0));
     const indices = Array.from(queueIndicesToRemove).sort((a,b)=> b-a); // remove in descending order
+    // For each matched queued index being removed, try to fill the vacancy by
+    // finding one idle player of similar level (diff <=1) to join the remaining 3.
+    // If found, create a new queued match using those 4; otherwise restore remaining players to idle.
+    const toRestore = [];
     indices.forEach(qi=>{
       const m = queue_matches[qi]; if(!m) return;
       const names = m.flat().map(p=> p ? p.name : '');
-      // remaining players are those not chosen as replacements
-      const remaining = names.filter(n=> !selNames.includes(n));
-      // add remaining players to front of idle preserving the relative order
-      for(let r=remaining.length-1; r>=0; r--){
-        const pname = remaining[r]; const pobj = players.find(p=> p.name === pname);
-        if(!pobj) continue;
-        // boost wait to ensure priority when re-building matches
-        pobj.wait = (maxWait + 100);
-        if(!idle_players.some(x=> x.name === pobj.name)) idle_players.unshift(pobj);
+      const remainingNames = names.filter(n=> !selNames.includes(n));
+      console.log('saveEditMatch: removing queued match index=', qi, 'names=', names, 'remaining=', remainingNames);
+      const remainingObjsLocal = remainingNames.map(nm=> players.find(p=> p.name === nm)).filter(x=>x);
+      // compute allowCrossType based on remainingObjsLocal + candidate
+      let filled = false;
+      if(remainingObjsLocal.length === 3){
+        // try to find a suitable idle filler
+        for(const cand of idle_players.slice()){
+          if(remainingObjsLocal.some(r=> r.name === cand.name)) continue;
+          // level similarity: candidate must differ by at most 1 from all remaining players
+          const levels = remainingObjsLocal.map(r=> r.level||0).concat([cand.level||0]);
+          const levMax = Math.max(...levels), levMin = Math.min(...levels);
+          if(levMax - levMin > 1) continue;
+          const group = [remainingObjsLocal[0], remainingObjsLocal[1], remainingObjsLocal[2], cand];
+          // do NOT allow cross-type pairing when filling a queued match — require both teams to be same type
+          const newMatch = best_match(group, false);
+          if(newMatch){
+            const newType0 = team_type(newMatch[0]); const newType1 = team_type(newMatch[1]);
+            // require resulting match to be same-type (e.g., MM vs MM or MF vs MF)
+            if(newType0 === newType1){
+              // if original queued match had a clear type (both teams same), prefer same type
+              const origType0 = team_type(m[0]); const origType1 = team_type(m[1]);
+              const origType = (origType0 === origType1) ? origType0 : null;
+              if(origType && newType0 !== origType){
+                // reject this candidate because it changes match type
+                continue;
+              }
+              // accept: remove old queued match and insert new one (only if none of these players are already assigned/queued)
+              const newNames = newMatch.flat().map(p=> p.name);
+              if(anyNameAssignedOrQueued(newNames)){
+                // skip this filler because players already assigned or queued
+                continue;
+              }
+              queue_matches.splice(qi,1);
+              queue_matches.unshift(newMatch);
+              const ridx = idle_players.findIndex(x=> x.name === cand.name); if(ridx!==-1) idle_players.splice(ridx,1);
+              console.log('saveEditMatch: filled vacancy with idle candidate=', cand.name, 'created match=', newMatch.flat().map(p=>p.name));
+              logLine(`editMatch: filled vacancy with filler=${cand.name} newMatch=${JSON.stringify(newMatch.flat().map(p=>p.name))}`);
+              filled = true; break;
+            } else {
+              // resulting match mixes types — reject
+              continue;
+            }
+          }
+        }
       }
-      // remove this queued match
-      queue_matches.splice(qi,1);
+      if(!filled){
+        // remove this queued match and prepare to restore remaining players into idle
+        queue_matches.splice(qi,1);
+        remainingObjsLocal.forEach(pobj=>{
+          pobj.wait = (maxWait + 100); pobj.wait_for_partner = false; pobj.ready = true; toRestore.push(pobj);
+        });
+        console.log('saveEditMatch: queue_matches after splice=', queue_matches.map(m=> m? m.flat().map(p=>p.name): null));
+        logLine(`editMatch: removed queued index=${qi} queue_after=${JSON.stringify(queue_matches.map(m=> m? m.flat().map(p=>p.name): null))}`);
+      }
     });
+    // Recompute idle_players from current assigned state, then prepend restored players preserving order
+    updateIdlePlayers();
+    for(let i=toRestore.length-1; i>=0; i--){ const pobj = toRestore[i]; if(!idle_players.some(x=> x.name === pobj.name)) idle_players.unshift(pobj); }
+    console.log('saveEditMatch: idle_players after restoring remaining=', idle_players.map(p=>p.name));
   }
+  // immediate queue formation deferred until after replacements and cleanup
   // perform replacements: for any name different from current, find player object and swap into this match
   for(let i=0;i<selNames.length;i++){
     const newName = selNames[i]; const oldName = currentPlayers[i];
@@ -524,11 +718,93 @@ function saveEditMatch(){
     const nid = idle_players.findIndex(p=> p.name === newName); if(nid !== -1) idle_players.splice(nid,1);
     if(oldPlayer){ if(!idle_players.some(p=>p.name === oldPlayer.name)) idle_players.push(oldPlayer); }
   }
-  // After replacements, rebuild the queue so queued matches are re-computed using updated pool
+
+  // Ensure any player now assigned to a court is not present in any queued match.
+  // Remove queued matches that include an assigned player and restore their remaining players to idle.
+  const assignedNames = new Set();
+  active_matches.forEach(m=>{ if(m) m.flat().forEach(p=>{ if(p) assignedNames.add(p.name); }); });
+  if(queue_matches && queue_matches.length){
+    const maxWait = Math.max(0, ...players.map(p=> p.wait || 0));
+    for(let qi = queue_matches.length-1; qi>=0; qi--){
+      const qm = queue_matches[qi]; if(!qm) continue;
+      const qnames = qm.flat().map(p=> p ? p.name : '');
+      const intersects = qnames.some(n=> assignedNames.has(n));
+      if(intersects){
+        // remove this queued match and restore non-assigned players to idle
+        const remaining = qnames.filter(n=> !assignedNames.has(n));
+        queue_matches.splice(qi,1);
+        remaining.forEach(rn=>{
+          const pobj = players.find(p=> p.name === rn); if(!pobj) return;
+          pobj.wait = (maxWait + 100); pobj.wait_for_partner = false; pobj.ready = true;
+          if(!idle_players.some(x=> x.name === pobj.name)) idle_players.unshift(pobj);
+        });
+        console.log('saveEditMatch: removed queued match containing assigned player, restored remaining=', remaining);
+      }
+    }
+  }
+  // After replacements, persist and refresh idle list.
+  // NOTE: do NOT call rebuildQueueAfterEdit() here because it rebuilds the entire queue
+  // (overwriting other queued matches). We only removed the specific queued matches
+  // above and restored remaining players to idle, so keep other queue entries intact.
   saveState(); updateIdlePlayers();
-  rebuildQueueAfterEdit();
+  logLine(`editMatch: postReplace active=${JSON.stringify(active_matches.map(m=> m? m.flat().map(p=>p.name): null))} queue=${JSON.stringify(queue_matches.map(m=> m? m.flat().map(p=>p.name): null))} idle=${JSON.stringify(idle_players.map(p=>p.name))}`);
   // clear partnerSlot if the edited match now contains two players who had set the same partner
   processMatchPartners(active_matches[idx]);
+  // Now attempt to form a queued match from idle players (deferred until after replacements/cleanup)
+  try{
+    updateIdlePlayers();
+    if(idle_players.length >= 4){
+      let formed = false;
+      const n = idle_players.length;
+      for(let i=0;i<n-3 && !formed;i++){
+        for(let j=i+1;j<n-2 && !formed;j++){
+          for(let k=j+1;k<n-1 && !formed;k++){
+            for(let l=k+1;l<n && !formed;l++){
+              const group = [idle_players[i], idle_players[j], idle_players[k], idle_players[l]];
+              const femaleCount = group.filter(p=>p.gender==='female').length;
+              const allowCrossType = (femaleCount % 2 === 1);
+              const m = best_match(group, allowCrossType);
+              if(m){
+                // ensure none of these players are assigned or already queued
+                const names = m.flat().map(p=> p.name);
+                if(anyNameAssignedOrQueued(names)) continue;
+                // add this match to front of queue
+                queue_matches.unshift(m);
+                // remove these players from idle_players (by name)
+                names.forEach(nm=>{ const idx = idle_players.findIndex(x=> x.name===nm); if(idx!==-1) idle_players.splice(idx,1); });
+                console.log('saveEditMatch: formed immediate queued match from idle (deferred):', names);
+                logLine(`editMatch: immediateQueuedMatch(deferred)=${JSON.stringify(names)}`);
+                formed = true; break;
+              }
+            }
+          }
+        }
+      }
+      if(formed) saveState();
+    }
+    // fallback: if direct formation failed, try using create_matches candidates filtered by idle players
+    if(queue_matches.length === 0){
+      const idleNames = new Set(idle_players.map(p=>p.name));
+      const candidates = create_matches();
+      for(const cand of candidates){
+        if(!cand) continue;
+        const names = cand.flat().map(p=> p ? p.name : '');
+        const allIdle = names.every(n=> idleNames.has(n));
+          if(allIdle){
+          // defensive: ensure none of these names are assigned to active or already queued
+          if(names.some(nm=> (new Set(active_matches.flat().filter(x=>x).flat().map(p=>p.name))).has(nm))) continue;
+          if(anyNameAssignedOrQueued(names)) continue;
+          queue_matches.unshift(cand);
+          names.forEach(nm=>{ const idx = idle_players.findIndex(x=> x.name===nm); if(idx!==-1) idle_players.splice(idx,1); });
+          console.log('saveEditMatch: formed immediate queued match from idle (fallback):', names);
+          logLine(`editMatch: immediateQueuedMatch(fallback)=${JSON.stringify(names)}`);
+          saveState(); break;
+        }
+      }
+    }
+  }catch(e){ console.error('saveEditMatch: error forming immediate queue', e); }
+  // normalize idleOrder for assigned players and persist
+  normalizeIdleOrders(); saveState();
   renderCourt(idx); renderQueue(); renderIdle(); renderAdminPlayers();
   const modalEl = document.getElementById('editMatchModal'); const modal = bootstrap.Modal.getInstance(modalEl); if(modal) modal.hide();
 }
@@ -618,12 +894,15 @@ function applyResult(courtIdx, scoreStr){
       if(team_type(team1) !== team_type(team2) && !allowCrossType) continue;
       const m = best_match([team1[0],team1[1],team2[0],team2[1]], allowCrossType);
       if(m){
-        queue_matches.push(m);
-        // remove chosen opponents from idle_players
-        m[0].forEach(p=>{ let idx=idle_players.indexOf(p); if(idx!==-1) idle_players.splice(idx,1); });
-        m[1].forEach(p=>{ let idx=idle_players.indexOf(p); if(idx!==-1) idle_players.splice(idx,1); });
-        logLine(`queued couple-priority match ${m[0][0].name}+${m[0][1].name} vs ${m[1][0].name}+${m[1][1].name}`);
-        return true;
+        const names = m.flat().map(p=>p.name);
+        if(!anyNameAssignedOrQueued(names)){
+          queue_matches.push(m);
+          // remove chosen opponents from idle_players
+          m[0].forEach(p=>{ let idx=idle_players.indexOf(p); if(idx!==-1) idle_players.splice(idx,1); });
+          m[1].forEach(p=>{ let idx=idle_players.indexOf(p); if(idx!==-1) idle_players.splice(idx,1); });
+          logLine(`queued couple-priority match ${m[0][0].name}+${m[0][1].name} vs ${m[1][0].name}+${m[1][1].name}`);
+          return true;
+        }
       }
     }
     return false;
@@ -684,14 +963,21 @@ function applyResult(courtIdx, scoreStr){
         processMatchPartners(active_matches[courtIdx]);
         logLine(`assigned new match to freed court ${courtIdx+1} ${newMatch[0][0].name}+${newMatch[0][1].name} vs ${newMatch[1][0].name}+${newMatch[1][1].name}`);
       } else {
-        queue_matches.push(newMatch);
-        logLine(`queued new match ${newMatch[0][0].name}+${newMatch[0][1].name} vs ${newMatch[1][0].name}+${newMatch[1][1].name}`);
+        const newNames = newMatch[0].concat(newMatch[1]).map(p=>p.name);
+        if(!anyNameAssignedOrQueued(newNames)){
+          queue_matches.push(newMatch);
+          logLine(`queued new match ${newMatch[0][0].name}+${newMatch[0][1].name} vs ${newMatch[1][0].name}+${newMatch[1][1].name}`);
+        } else {
+          logLine('skipped queuing newMatch due to existing assignment/queue');
+        }
       }
     } else {
       logLine('skipped new match due to conflict with active courts');
     }
   }
   idle_players.forEach(p=>p.wait++);
+  // clear idleOrder for any players now assigned and persist
+  normalizeIdleOrders();
   saveState();
   try{ localStorage.setItem('badminton_log', JSON.stringify(debug_log)); }catch(e){ console.error('failed to flush log after saveState', e); }
   // snapshot post-state for comparison
@@ -731,8 +1017,104 @@ function create_new_match(free_players){
     if(partner.wait_for_partner) return false;
     return availNames.has(partner.name); // only include if partner is also available
   });
+  // URGENT PRIORITY: if any players have been idle for >=3 rounds (p.wait >= 3),
+  // force an attempt to include them in the next match before other selection.
+  // Try to pair the two oldest- waiting urgent players together first, then
+  // try to include a single urgent player if only one exists.
+  const urgent = pool.slice().filter(p=> (p.wait || 0) >= 3).sort((a,b)=> (b.wait||0) - (a.wait||0));
+  if(urgent.length >= 2){
+    const a = urgent[0], b = urgent[1];
+    const others = pool.filter(p=> p.name !== a.name && p.name !== b.name);
+    for(let i=0;i<others.length;i++){
+      for(let j=i+1;j<others.length;j++){
+        const group = [a, b, others[i], others[j]];
+        const femaleCount = group.filter(p=>p.gender === 'female').length;
+        const allowCross = (femaleCount % 2 === 1);
+        const m = best_match(group, allowCross);
+        if(m){
+          m[0].forEach(p=>{ let idx=idle_players.findIndex(x=>x.name===p.name); if(idx!=-1) idle_players.splice(idx,1); });
+          m[1].forEach(p=>{ let idx=idle_players.findIndex(x=>x.name===p.name); if(idx!=-1) idle_players.splice(idx,1); });
+          return m;
+        }
+      }
+    }
+  }
+  if(urgent.length === 1){
+    const seed = urgent[0];
+    const others = pool.filter(p=> p.name !== seed.name);
+    if(others.length >= 3){
+      for(let i=0;i<others.length;i++){
+        for(let j=i+1;j<others.length;j++){
+          for(let k=j+1;k<others.length;k++){
+            const group = [seed, others[i], others[j], others[k]];
+            const femaleCount = group.filter(p=>p.gender === 'female').length;
+            const allowCross = (femaleCount % 2 === 1);
+            const m = best_match(group, allowCross);
+            if(!m) continue;
+            const names = m.flat().map(p=>p.name);
+            if(!names.includes(seed.name)) continue;
+            m[0].forEach(p=>{ let idx=idle_players.findIndex(x=>x.name===p.name); if(idx!=-1) idle_players.splice(idx,1); });
+            m[1].forEach(p=>{ let idx=idle_players.findIndex(x=>x.name===p.name); if(idx!=-1) idle_players.splice(idx,1); });
+            return m;
+          }
+        }
+      }
+    }
+  }
   // For any free_players that were excluded because their partner wasn't available, ensure they stay idle (wait)
   (available_free||[]).forEach(p=>{ if(!pool.some(x=>x.name===p.name) && !idle_players.some(x=>x.name===p.name)) idle_players.push(p); });
+  // HARD ENFORCEMENT: if there are idle players with `idleOrder`, force them into the next match.
+  // Attempt to include the two oldest idle players as a team; if not possible, include the single oldest.
+  const poolSortedByIdle = pool.slice().sort((a,b)=> ((a.idleOrder||Infinity) - (b.idleOrder||Infinity)));
+  const oldest = poolSortedByIdle.filter(x=> x.idleOrder !== undefined && x.idleOrder !== null);
+  if(oldest.length > 0){
+    const topA = oldest[0];
+    const topB = (oldest.length > 1) ? oldest[1] : null;
+    // try top-2 as a partnered team
+    if(topB){
+      const others = pool.filter(p=> p.name !== topA.name && p.name !== topB.name);
+      for(let i=0;i<others.length;i++){
+        for(let j=i+1;j<others.length;j++){
+          const candGroup = [topA, topB, others[i], others[j]];
+          const femaleCountCand = candGroup.filter(p=> p.gender === 'female').length;
+          const allowCross = (femaleCountCand % 2 === 1);
+          const m = best_match(candGroup, allowCross);
+          if(!m) continue;
+          const teamNames0 = m[0].map(x=>x.name).sort().join('|');
+          const teamNames1 = m[1].map(x=>x.name).sort().join('|');
+          const wanted = [topA.name, topB.name].sort().join('|');
+          if(teamNames0 === wanted || teamNames1 === wanted){
+            m[0].forEach(p=>{ let idx=idle_players.findIndex(x=>x.name===p.name); if(idx!=-1) idle_players.splice(idx,1); });
+            m[1].forEach(p=>{ let idx=idle_players.findIndex(x=>x.name===p.name); if(idx!=-1) idle_players.splice(idx,1); });
+            return m;
+          }
+        }
+      }
+    }
+    // try include top-1 anywhere in match
+    const seed = topA;
+    const others = pool.filter(p=> p.name !== seed.name);
+    if(others.length >= 3){
+      for(let i=0;i<others.length;i++){
+        for(let j=i+1;j<others.length;j++){
+          for(let k=j+1;k<others.length;k++){
+            const group = [seed, others[i], others[j], others[k]];
+            const femaleCount = group.filter(p=> p.gender === 'female').length;
+            const allowCross = (femaleCount % 2 === 1);
+            const m = best_match(group, allowCross);
+            if(!m) continue;
+            const names = m.flat().map(p=>p.name);
+            if(!names.includes(seed.name)) continue;
+            m[0].forEach(p=>{ let idx=idle_players.findIndex(x=>x.name===p.name); if(idx!=-1) idle_players.splice(idx,1); });
+            m[1].forEach(p=>{ let idx=idle_players.findIndex(x=>x.name===p.name); if(idx!=-1) idle_players.splice(idx,1); });
+            return m;
+          }
+        }
+      }
+    }
+    // hard enforcement: nothing found including the oldest idle player(s)
+    return null;
+  }
   const femaleCount = pool.filter(p=>p.gender === 'female').length;
   const allowCrossType = (femaleCount % 2 === 1);
     if(pool.length <4){
@@ -805,11 +1187,29 @@ function processMatchPartners(match){
   if(changed){ saveState(); renderAdminPlayers(); }
 }
 
+// Helper: returns true if any name in `names` is present in active_matches or queue_matches
+function anyNameAssignedOrQueued(names){
+  const assigned = new Set();
+  active_matches.forEach(m=>{ if(m) m.flat().forEach(p=>{ if(p) assigned.add(p.name); }); });
+  queue_matches.forEach(m=>{ if(m) m.flat().forEach(p=>{ if(p) assigned.add(p.name); }); });
+  return names.some(n=> assigned.has(n));
+}
+
+// Clear idleOrder for players that are currently assigned to active courts or queued
+function normalizeIdleOrders(){
+  const assigned = new Set();
+  active_matches.forEach(m=>{ if(m) m.flat().forEach(p=>{ if(p) assigned.add(p.name); }); });
+  queue_matches.forEach(m=>{ if(m) m.flat().forEach(p=>{ if(p) assigned.add(p.name); }); });
+  players.forEach(p=>{ if(assigned.has(p.name)) p.idleOrder = null; });
+}
+
 function updateIdlePlayers(){
   const assigned = new Set();
   active_matches.forEach(m=>{ if(m) m.flat().forEach(p=>assigned.add(p.name)); });
   queue_matches.forEach(m=>{ if(m) m.flat().forEach(p=>assigned.add(p.name)); });
   idle_players = players.filter(p=> p.ready && !assigned.has(p.name) && !p.wait_for_partner);
+  // assign idleOrder for newly idle players; keep existing order if present
+  idle_players.forEach(p=>{ if(p.idleOrder === undefined || p.idleOrder === null){ idleSeq += 1; p.idleOrder = idleSeq; } });
 }
 
 // persistence
@@ -832,8 +1232,12 @@ function loadState(){
         ready: (p0.ready === undefined) ? true : p0.ready,
         couple: (p0.couple === undefined) ? null : p0.couple,
         uncouple: (p0.uncouple === undefined) ? null : p0.uncouple,
-        partnerSlot: (p0.partnerSlot === undefined) ? null : p0.partnerSlot
+        partnerSlot: (p0.partnerSlot === undefined) ? null : p0.partnerSlot,
+        idleOrder: (p0.idleOrder === undefined) ? null : p0.idleOrder
       }));
+      // initialize idleSeq to current max idleOrder
+      const maxIdle = players.reduce((acc,p)=> Math.max(acc, p.idleOrder || 0), 0);
+      idleSeq = Math.max(idleSeq, maxIdle);
     }catch(e){ console.error('failed to parse badminton_players', e); }
   }
   let h=localStorage.getItem('badminton_history'); if(h){ try{ match_history = JSON.parse(h); }catch(e){ console.error('failed to parse badminton_history', e); } }

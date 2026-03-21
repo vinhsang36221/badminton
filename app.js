@@ -98,6 +98,43 @@ function onPlayerDrop(e){
   try{ performSwap(src, dst); }catch(err){ console.error('drop swap failed', err); }
 }
 
+// Match-level Drag & Drop (queue -> court)
+function onMatchDragStart(e){
+  let el = e.currentTarget || e.target;
+  // climb to list item if needed
+  while(el && !el.getAttribute) el = el.parentElement;
+  while(el && !el.getAttribute('data-queue-index')) el = el.parentElement;
+  if(!el) return;
+  const qi = el.getAttribute('data-queue-index');
+  if(!qi) return;
+  try{ e.dataTransfer.setData('text/plain', 'match:'+qi); e.dataTransfer.effectAllowed = 'move'; }catch(e){ }
+}
+function onMatchDragOver(e){ e.preventDefault(); try{ e.dataTransfer.dropEffect = 'move'; }catch(e){} }
+function onMatchDrop(e){
+  e.preventDefault();
+  const data = e.dataTransfer.getData('text/plain') || '';
+  if(!data.startsWith('match:')) return;
+  const parts = data.split(':'); const qidx = parseInt(parts[1],10);
+  if(isNaN(qidx)) return;
+  // find court index from drop target (ancestor with data-court-index)
+  let el = e.currentTarget || e.target;
+  while(el && !(el.getAttribute && el.getAttribute('data-court-index'))) el = el.parentElement;
+  if(!el) return;
+  const ci = parseInt(el.getAttribute('data-court-index'),10);
+  if(isNaN(ci)) return;
+  // remove the queued match (if still present at that index)
+  let removed = null;
+  if(qidx >=0 && qidx < queue_matches.length) removed = queue_matches.splice(qidx,1)[0];
+  else removed = queue_matches.shift();
+  if(!removed) return;
+  // if court currently occupied, push the existing active match to front of queue
+  if(active_matches[ci]){ queue_matches.unshift(active_matches[ci]); }
+  active_matches[ci] = removed;
+  processMatchPartners(active_matches[ci]);
+  saveState(); updateIdlePlayers(); render(); renderAdminPlayers();
+  logLine(`matchDrag: moved queued[${qidx}] -> court ${ci}`);
+}
+
 function getPlayerAtLoc(loc){
   const parts = loc.split(':');
   if(parts[0] === 'court'){
@@ -524,6 +561,8 @@ function renderCourt(i){
       </div>`;
   }
   card.innerHTML = html;
+  // expose court index and accept match-level drops
+  try{ card.setAttribute('data-court-index', String(i)); card.ondragover = onMatchDragOver; card.ondrop = onMatchDrop; }catch(e){}
   const btn = card.querySelector('button[data-court]'); if(btn) btn.onclick = ()=> openScoreModal(i);
 }
 
@@ -533,6 +572,13 @@ function renderQueue(){
     const m = queue_matches[qi]; if(!m) continue;
     let [t1,t2]=m;
     let li=document.createElement('li'); li.className='list-group-item';
+    // make the whole queued match draggable as a unit
+    li.setAttribute('data-queue-index', String(qi));
+    li.draggable = true;
+    li.ondragstart = onMatchDragStart;
+    li.ondragover = onMatchDragOver;
+    // prevent player-level drops onto the list item
+    li.ondrop = (e)=>{ e.preventDefault(); };
     li.innerHTML = `${renderPlayerSpan(t1[0], 'queue:'+qi+':0:0')} - ${renderPlayerSpan(t1[1], 'queue:'+qi+':0:1')} &nbsp;&nbsp; vs &nbsp;&nbsp; ${renderPlayerSpan(t2[0], 'queue:'+qi+':1:0')} - ${renderPlayerSpan(t2[1], 'queue:'+qi+':1:1')}`;
     queueList.appendChild(li);
   }

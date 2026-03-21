@@ -98,6 +98,66 @@ function onPlayerDrop(e){
   try{ performSwap(src, dst); }catch(err){ console.error('drop swap failed', err); }
 }
 
+// Match-handle drag: swap whole matches (queue <-> queue, queue <-> court, court <-> court)
+function matchHandleDragStart(e){
+  const el = e.currentTarget || e.target;
+  const q = el.getAttribute && el.getAttribute('data-queue-index');
+  const c = el.getAttribute && el.getAttribute('data-court-index');
+  if(q !== null && q !== undefined){ e.dataTransfer.setData('text/plain', 'match:queue:'+q); }
+  else if(c !== null && c !== undefined){ e.dataTransfer.setData('text/plain', 'match:court:'+c); }
+  e.dataTransfer.effectAllowed = 'move';
+}
+function matchHandleDragOver(e){ e.preventDefault(); try{ e.dataTransfer.dropEffect = 'move'; }catch(e){} }
+function matchHandleDrop(e){
+  e.preventDefault();
+  const data = e.dataTransfer.getData('text/plain') || '';
+  if(!data.startsWith('match:')) return;
+  const parts = data.split(':'); // ['match','queue'|'court', idx]
+  if(parts.length < 3) return;
+  const srcType = parts[1]; const srcIdx = parseInt(parts[2],10);
+
+  // determine destination: could be a queue item or a court card
+  let tgt = e.currentTarget || e.target;
+  // if target is inside a queue li, find its queue index
+  let dstQueue = null; let dstCourt = null;
+  while(tgt){ if(tgt.getAttribute){ if(tgt.getAttribute('data-queue-index')){ dstQueue = parseInt(tgt.getAttribute('data-queue-index'),10); break; } if(tgt.getAttribute('data-court-index')){ dstCourt = parseInt(tgt.getAttribute('data-court-index'),10); break; } } tgt = tgt.parentElement; }
+
+  // perform swap based on src/dst types
+  try{
+    if(srcType === 'queue' && dstQueue !== null){
+      // swap positions within queue
+      const a = queue_matches[srcIdx]; const b = queue_matches[dstQueue]; if(!a || !b) return;
+      queue_matches[srcIdx] = b; queue_matches[dstQueue] = a;
+      saveState(); renderQueue(); render(); logLine(`swap: queue[${srcIdx}] <-> queue[${dstQueue}]`); return;
+    }
+    if(srcType === 'queue' && dstCourt !== null){
+      // move queued match into court, existing court match goes to queue slot (srcIdx)
+      const qmatch = queue_matches[srcIdx]; if(!qmatch) return;
+      const replaced = active_matches[dstCourt];
+      // place replaced into the queue at srcIdx (or push if srcIdx out of range)
+      if(replaced) queue_matches[srcIdx] = replaced; else queue_matches.splice(srcIdx,1);
+      active_matches[dstCourt] = qmatch;
+      // remove original queued entry if we moved it
+      if(queue_matches[srcIdx] === qmatch) { /* already set */ }
+      else { const found = queue_matches.findIndex(m=> m===qmatch); if(found!==-1) queue_matches.splice(found,1); }
+      saveState(); updateIdlePlayers(); render(); renderAdminPlayers(); logLine(`swap: queue[${srcIdx}] -> court[${dstCourt}]`); return;
+    }
+    if(srcType === 'court' && dstQueue !== null){
+      const cmatch = active_matches[srcIdx]; if(!cmatch) return;
+      const replaced = queue_matches[dstQueue];
+      // place replaced into court
+      active_matches[srcIdx] = replaced || null;
+      queue_matches[dstQueue] = cmatch;
+      saveState(); updateIdlePlayers(); render(); renderAdminPlayers(); logLine(`swap: court[${srcIdx}] -> queue[${dstQueue}]`); return;
+    }
+    if(srcType === 'court' && dstCourt !== null){
+      // swap two active courts
+      const a = active_matches[srcIdx]; const b = active_matches[dstCourt]; active_matches[srcIdx] = b; active_matches[dstCourt] = a;
+      saveState(); updateIdlePlayers(); render(); renderAdminPlayers(); logLine(`swap: court[${srcIdx}] <-> court[${dstCourt}]`); return;
+    }
+  }catch(err){ console.error('matchHandleDrop failed', err); }
+}
+
 // (removed match-level drag/drop support) - revert to player-level only
 
 function getPlayerAtLoc(loc){
@@ -511,10 +571,10 @@ function renderCourt(i){
         <div class="w-100 text-center fs-5 fw-bold">Sân ${10 + i}</div>
       </div>
       <div class="card-body d-flex align-items-center">
-        <div class="team-col text-center flex-fill"><div class="team-row">${renderPlayerSpan(t1[0], 'court:'+i+':0:0')}<span class="sep">-</span>${renderPlayerSpan(t1[1], 'court:'+i+':0:1')}</div></div>
+        <div class="team-col text-center flex-fill"><div class="team-row"><span class="match-handle-card me-2 align-middle" data-court-index="${i}" draggable="true">≡</span>${renderPlayerSpan(t1[0], 'court:'+i+':0:0')}<span class="sep">-</span>${renderPlayerSpan(t1[1], 'court:'+i+':0:1')}</div></div>
         <div class="vs-col text-center px-2"><strong>VS</strong></div>
         <div class="team-col text-center flex-fill"><div class="team-row">${renderPlayerSpan(t2[0], 'court:'+i+':1:0')}<span class="sep">-</span>${renderPlayerSpan(t2[1], 'court:'+i+':1:1')}</div></div>
-        <div class="enter-col ms-2"><button class="btn btn-sm btn-enter-score" data-court="${i}">Enter score</button></div>
+        <div class="enter-col ms-2"><button class="btn btn-sm btn-enter-score" data-court="${i}">Enter Result</button></div>
       </div>
     </div>`;
   } else {
@@ -526,6 +586,13 @@ function renderCourt(i){
       </div>`;
   }
   card.innerHTML = html;
+  // wire match-handle on court header (if present)
+  try{
+    const mh = card.querySelector('.match-handle-card');
+    if(mh){ mh.ondragstart = matchHandleDragStart; mh.ondragover = matchHandleDragOver; mh.ondrop = matchHandleDrop; mh.setAttribute('data-court-index', String(i)); }
+    // allow dropping a match onto the court card
+    card.ondragover = matchHandleDragOver; card.ondrop = matchHandleDrop;
+  }catch(e){}
   const btn = card.querySelector('button[data-court]'); if(btn) btn.onclick = ()=> openScoreModal(i);
 }
 
@@ -534,9 +601,14 @@ function renderQueue(){
   for(let qi=0; qi<queue_matches.length; qi++){
     const m = queue_matches[qi]; if(!m) continue;
     let [t1,t2]=m;
-    let li=document.createElement('li'); li.className='list-group-item';
-    li.innerHTML = `${renderPlayerSpan(t1[0], 'queue:'+qi+':0:0')} - ${renderPlayerSpan(t1[1], 'queue:'+qi+':0:1')} &nbsp;&nbsp; vs &nbsp;&nbsp; ${renderPlayerSpan(t2[0], 'queue:'+qi+':1:0')} - ${renderPlayerSpan(t2[1], 'queue:'+qi+':1:1')}`;
-    queueList.appendChild(li);
+    let li=document.createElement('li'); li.className='list-group-item d-flex align-items-center';
+    // handle icon for dragging the whole match
+    const handle = document.createElement('span'); handle.className = 'match-handle me-2'; handle.textContent = '≡'; handle.setAttribute('data-queue-index', String(qi)); handle.draggable = true; handle.ondragstart = matchHandleDragStart; handle.ondragover = matchHandleDragOver; handle.ondrop = matchHandleDrop;
+    li.appendChild(handle);
+    const label = document.createElement('div'); label.className = 'flex-fill'; label.innerHTML = `${renderPlayerSpan(t1[0], 'queue:'+qi+':0:0')} - ${renderPlayerSpan(t1[1], 'queue:'+qi+':0:1')} &nbsp;&nbsp; vs &nbsp;&nbsp; ${renderPlayerSpan(t2[0], 'queue:'+qi+':1:0')} - ${renderPlayerSpan(t2[1], 'queue:'+qi+':1:1')}`;
+    li.appendChild(label);
+    // allow dropping a match onto this queue slot
+    li.ondragover = matchHandleDragOver; li.ondrop = matchHandleDrop; queueList.appendChild(li);
   }
 }
 
@@ -559,14 +631,37 @@ function renderHistory(){
     if(m.note){
       d.textContent = `${m.note}`;
     } else {
-      d.textContent = `${m.team1.join(' - ')} ${m.score?m.score[0]+"-"+m.score[1]:"(no score)"} ${m.team2.join(' - ')}  delta=${m.rating_delta}`;
+      const t1 = m.team1.join(' - ');
+      const t2 = m.team2.join(' - ');
+      if(m.winnerTeam){
+        if(m.winnerTeam === 1){
+          if(m.score){ d.textContent = `${t1} (${m.score[0]}-${m.score[1]}) (win +${m.rating_delta_winner}) ${t2} (lose ${m.rating_delta_loser})`; }
+          else { d.textContent = `${t1} (win +${m.rating_delta_winner}) ${t2} (lose ${m.rating_delta_loser})`; }
+        } else {
+          if(m.score){ d.textContent = `${t2} (${m.score[0]}-${m.score[1]}) (win +${m.rating_delta_winner}) ${t1} (lose ${m.rating_delta_loser})`; }
+          else { d.textContent = `${t2} (win +${m.rating_delta_winner}) ${t1} (lose ${m.rating_delta_loser})`; }
+        }
+      } else {
+        const deltaStr = (m.rating_delta_winner !== undefined && m.rating_delta_loser !== undefined) ? (`+${m.rating_delta_winner}/ ${m.rating_delta_loser}`) : (m.rating_delta !== undefined ? `delta=${m.rating_delta}` : '');
+        d.textContent = `${t1} ${m.score?m.score[0]+"-"+m.score[1]:"(no score)"} ${t2}  ${deltaStr}`;
+      }
     }
     hb.appendChild(d);
   });
 }
 
 function openScoreModal(courtIdx){
-  document.getElementById('modalCourtIdx').value=courtIdx;
+  document.getElementById('modalCourtIdx').value = courtIdx;
+  // Fill team buttons with player names for clarity
+  const modalT1 = document.getElementById('modalTeam1');
+  const modalT2 = document.getElementById('modalTeam2');
+  const match = active_matches[courtIdx];
+  if(modalT1 && modalT2 && match){
+    const t1 = match[0].map(p=> p ? p.name : '').join(' - ');
+    const t2 = match[1].map(p=> p ? p.name : '').join(' - ');
+    modalT1.textContent = `Team 1: ${t1}`;
+    modalT2.textContent = `Team 2: ${t2}`;
+  }
   const modal = new bootstrap.Modal(document.getElementById('scoreModal'));
   modal.show();
 }
@@ -855,15 +950,40 @@ function applyResult(courtIdx, scoreStr){
     }
   }
   let winners, losers, margin=null;
-  if(s1==null || s2==null){ let pick = confirm('Mark team1 as winner? OK=team1, Cancel=team2'); if(pick){ winners=t1; losers=t2; } else { winners=t2; losers=t1; } }
+  // support explicit result flags from the simplified modal
+  if(scoreStr === 'T1'){ winners = t1; losers = t2; }
+  else if(scoreStr === 'T2'){ winners = t2; losers = t1; }
+  else if(s1==null || s2==null){ let pick = confirm('Mark team1 as winner? OK=team1, Cancel=team2'); if(pick){ winners=t1; losers=t2; } else { winners=t2; losers=t1; } }
   else { if(s1> s2){ winners=t1; losers=t2; } else { winners=t2; losers=t1; } margin = Math.abs(s1-s2); }
 
   let tr1 = team_rating(t1), tr2 = team_rating(t2);
   if(s1!=null && s2!=null){ t1.forEach(p=>{ p.points_for+=s1; p.points_against+=s2; }); t2.forEach(p=>{ p.points_for+=s2; p.points_against+=s1; }); }
-  let delta_base = 10; let delta = delta_base + (margin?margin:0);
-  winners.forEach(p=>p.rating += delta); losers.forEach(p=>p.rating -= delta);
+  // New rating rules: winner gains, loser loses (smaller loss for close matches)
+  const delta_base = 10;
+  let winnerGain = delta_base;
+  let loserLoss = Math.max(1, Math.floor(delta_base/2));
+  if(typeof margin === 'number' && !isNaN(margin)){
+    winnerGain = delta_base + margin;
+    loserLoss = Math.max(1, Math.floor((delta_base + margin)/2));
+  } else {
+    // no numeric score provided (T1/T2), use defaults
+    winnerGain = delta_base;
+    loserLoss = Math.max(1, Math.floor(delta_base/2));
+  }
+  winners.forEach(p=>p.rating += winnerGain); losers.forEach(p=>p.rating -= loserLoss);
   let key = [winners[0].name, winners[1].name].sort().join('|'); partner_history[key] = (partner_history[key]||0)+1;
-  match_history.push({ts: new Date().toISOString(), team1:[t1[0].name,t1[1].name], team2:[t2[0].name,t2[1].name], score: s1!=null?[s1,s2]:null, margin: margin, team_rating_before:[tr1,tr2], rating_delta:delta});
+  const winnerTeam = (winners === t1) ? 1 : 2;
+  match_history.push({
+    ts: new Date().toISOString(),
+    team1:[t1[0].name,t1[1].name],
+    team2:[t2[0].name,t2[1].name],
+    score: s1!=null?[s1,s2]:null,
+    margin: margin,
+    team_rating_before:[tr1,tr2],
+    rating_delta_winner: winnerGain,
+    rating_delta_loser: -loserLoss,
+    winnerTeam: winnerTeam
+  });
 
   // Keep couple flags intact so players who set partners are not cleared
   // This allows waiting/priority-pairing to work when partners finish at different times.
@@ -1212,6 +1332,8 @@ function updateIdlePlayers(){
   idle_players = players.filter(p=> p.ready && !assigned.has(p.name) && !p.wait_for_partner);
   // assign idleOrder for newly idle players; keep existing order if present
   idle_players.forEach(p=>{ if(p.idleOrder === undefined || p.idleOrder === null){ idleSeq += 1; p.idleOrder = idleSeq; } });
+  // sort idle players by their idleOrder ascending (older wait = higher priority)
+  idle_players.sort((a,b)=> (a.idleOrder||Infinity) - (b.idleOrder||Infinity));
 }
 
 // persistence
@@ -1374,8 +1496,8 @@ function importJSON(text){
 
 // export CSV
 function exportCSV(){
-  let rows = [['team1','team2','score','margin','rating_delta','tr_before1','tr_before2']];
-  match_history.forEach(m=> rows.push([m.team1.join('+'), m.team2.join('+'), m.score?m.score[0]+'-'+m.score[1]:'', m.margin||'', m.rating_delta||'', m.team_rating_before?m.team_rating_before[0]:'', m.team_rating_before?m.team_rating_before[1]:'']));
+  let rows = [['team1','team2','score','margin','rating_delta_winner','rating_delta_loser','tr_before1','tr_before2']];
+  match_history.forEach(m=> rows.push([m.team1.join('+'), m.team2.join('+'), m.score?m.score[0]+'-'+m.score[1]:'', m.margin||'', m.rating_delta_winner!==undefined?m.rating_delta_winner:'', m.rating_delta_loser!==undefined?m.rating_delta_loser:'', m.team_rating_before?m.team_rating_before[0]:'', m.team_rating_before?m.team_rating_before[1]:'']));
   let csv = rows.map(r=>r.map(c=>`"${(''+c).replace(/"/g,'""')}"`).join(',')).join('\n');
   let blob = new Blob([csv], {type:'text/csv'});
   let url = URL.createObjectURL(blob);
@@ -1395,7 +1517,19 @@ function downloadHistory(){
   }
   const lines = match_history.map(m=>{
     if(m.note) return `[${m.ts}] ${m.note} active=${JSON.stringify(m.active)} queue=${JSON.stringify(m.queue)} idle=${JSON.stringify(m.idle)}`;
-    return `[${m.ts}] ${m.team1.join('+')} ${m.score? (m.score[0]+'-'+m.score[1]) : '(no score)'} ${m.team2.join('+')}  delta=${m.rating_delta}`;
+    const t1 = m.team1.join(' + ');
+    const t2 = m.team2.join(' + ');
+    if(m.winnerTeam){
+      if(m.winnerTeam === 1){
+        if(m.score) return `[${m.ts}] ${t1} (${m.score[0]}-${m.score[1]}) (win +${m.rating_delta_winner}) ${t2} (lose ${m.rating_delta_loser})`;
+        return `[${m.ts}] ${t1} (win +${m.rating_delta_winner}) ${t2} (lose ${m.rating_delta_loser})`;
+      } else {
+        if(m.score) return `[${m.ts}] ${t2} (${m.score[0]}-${m.score[1]}) (win +${m.rating_delta_winner}) ${t1} (lose ${m.rating_delta_loser})`;
+        return `[${m.ts}] ${t2} (win +${m.rating_delta_winner}) ${t1} (lose ${m.rating_delta_loser})`;
+      }
+    }
+    const deltaStr = (m.rating_delta_winner !== undefined && m.rating_delta_loser !== undefined) ? (`+${m.rating_delta_winner}/ ${m.rating_delta_loser}`) : (m.rating_delta !== undefined ? `delta=${m.rating_delta}` : '');
+    return `[${m.ts}] ${t1} ${m.score? (m.score[0]+'-'+m.score[1]) : '(no score)'} ${t2}  ${deltaStr}`;
   });
   const blob = new Blob([lines.join('\n')], {type:'text/plain'});
   const url = URL.createObjectURL(blob);
@@ -1419,31 +1553,24 @@ active_matches = []; queue_matches = [];
 while(active_matches.length < COURTS) active_matches.push(null);
 updateIdlePlayers(); render(); renderAdminPlayers();
 
-// UI bindings
-document.getElementById('submitScore').onclick = ()=>{
-  let s = document.getElementById('scoreInput').value.trim(); let idx = parseInt(document.getElementById('modalCourtIdx').value);
-  logLine(`submitScore court=${idx+1} score=${s||''}`);
-  let modalEl = document.getElementById('scoreModal'); let modal = bootstrap.Modal.getInstance(modalEl);
-  applyResult(idx, s); modal.hide(); document.getElementById('scoreInput').value='';
-};
-
-// Auto-format score input: insert '-' after two digits while typing
-const scoreInputEl = document.getElementById('scoreInput');
-if(scoreInputEl){
-  scoreInputEl.setAttribute('inputmode','numeric');
-  scoreInputEl.addEventListener('input', function(e){
-    const cur = this.value || '';
-    // keep only digits
-    let digits = (cur.match(/\d+/g) || []).join('');
-    if(digits.length > 4) digits = digits.slice(0,4);
-    if(digits.length <= 2){
-      this.value = digits;
-    } else {
-      this.value = digits.slice(0,2) + '-' + digits.slice(2);
-    }
-    // move caret to end for simplicity
-    try{ this.selectionStart = this.selectionEnd = this.value.length; }catch(e){}
-  });
+// UI bindings for result modal: clicking team bars confirms winner
+const modalTeam1Btn = document.getElementById('modalTeam1');
+const modalTeam2Btn = document.getElementById('modalTeam2');
+if(modalTeam1Btn){
+  modalTeam1Btn.onclick = ()=>{
+    const idx = parseInt(document.getElementById('modalCourtIdx').value);
+    logLine(`submitResult court=${idx+1} winner=team1`);
+    const modalEl = document.getElementById('scoreModal'); const modal = bootstrap.Modal.getInstance(modalEl);
+    applyResult(idx, 'T1'); if(modal) modal.hide();
+  };
+}
+if(modalTeam2Btn){
+  modalTeam2Btn.onclick = ()=>{
+    const idx = parseInt(document.getElementById('modalCourtIdx').value);
+    logLine(`submitResult court=${idx+1} winner=team2`);
+    const modalEl = document.getElementById('scoreModal'); const modal = bootstrap.Modal.getInstance(modalEl);
+    applyResult(idx, 'T2'); if(modal) modal.hide();
+  };
 }
 
 document.getElementById('exportCsv').onclick = exportCSV; document.getElementById('resetData').onclick = resetAll;
@@ -1533,8 +1660,10 @@ function renderAdminPlayers(){
         return;
       }
       if(action==='toggleReady'){
-        players[idx].ready = !players[idx].ready;
-        updateIdlePlayers(); saveState(); render(); renderAdminPlayers(); return;
+        // Use centralized setter to ensure Display updates immediately
+        const newReady = !players[idx].ready;
+        setPlayerReady(idx, newReady);
+        return;
       }
       if(action==='toggleType'){
         const cur = players[idx].couple;
@@ -1588,6 +1717,140 @@ function renderAdminPlayers(){
       }
     };
   });
+}
+
+// Set player's ready state with immediate Display updates and queue/active cleanup
+function setPlayerReady(playerIdx, ready){
+  if(playerIdx < 0 || playerIdx >= players.length) return;
+  const pl = players[playerIdx];
+  pl.ready = !!ready;
+  const name = pl.name;
+
+  // Remove from idle if present
+  const idleIdx = idle_players.findIndex(x=> x.name === name);
+  if(idleIdx !== -1) idle_players.splice(idleIdx,1);
+
+  // Remove from active matches: if present, remove entire match and return remaining players to idle
+  for(let ci=0; ci<active_matches.length; ci++){
+    const m = active_matches[ci]; if(!m) continue;
+    const flat = m.flat();
+    if(flat.some(p=> p && p.name === name)){
+      // remove match and return other players to idle (if they are ready)
+      active_matches[ci] = null;
+      flat.forEach(p=>{ if(p && p.name !== name){ if(!idle_players.some(x=> x.name === p.name) && p.ready) idle_players.unshift(p); } });
+    }
+  }
+
+  // Process queue matches containing this player
+  for(let qi = queue_matches.length-1; qi>=0; qi--){
+    const qm = queue_matches[qi]; if(!qm) continue;
+    const flat = qm.flat();
+    if(flat.some(p=> p && p.name === name)){
+      // If we are setting player to not ready, handle removal
+      if(!pl.ready){
+        // If there is any idle player (other than this one), use first idle as replacement
+        const replacement = idle_players.find(x=> x.name !== name);
+        if(replacement){
+          // replace the removed player with replacement
+          for(let t=0;t<2;t++){ for(let s=0;s<2;s++){ const p = queue_matches[qi][t][s]; if(p && p.name === name) { queue_matches[qi][t][s] = replacement; } } }
+          // remove replacement from idle
+          const ridx = idle_players.findIndex(x=> x.name === replacement.name); if(ridx !== -1) idle_players.splice(ridx,1);
+        } else {
+          // no idle to replace: remove queued match and move remaining players into idle
+          queue_matches.splice(qi,1);
+          flat.forEach(p=>{ if(p && p.name !== name){ if(!idle_players.some(x=> x.name===p.name) && p.ready) idle_players.unshift(p); } });
+        }
+      } else {
+        // setting to ready while in queue shouldn't happen here, but ensure player not duplicated in idle
+        // no-op
+      }
+    }
+  }
+
+  // Ensure player is removed from any queue slots still containing them (defensive)
+  for(let qi=queue_matches.length-1; qi>=0; qi--){
+    const qm = queue_matches[qi]; if(!qm) continue;
+    let changed=false;
+    for(let t=0;t<2;t++) for(let s=0;s<2;s++){ const p = queue_matches[qi][t][s]; if(p && p.name === name){ queue_matches[qi][t][s] = null; changed = true; } }
+    if(changed){
+      // if match now incomplete, and idle has replacements we try to fill from idle
+      const filled = queue_matches[qi].flat().every(x=> x);
+      if(!filled){
+        const anyIdle = idle_players.length>0;
+        if(anyIdle){
+          // try simple fill: replace first null with first idle
+          for(let t=0;t<2;t++) for(let s=0;s<2;s++){ if(!queue_matches[qi][t][s]){ queue_matches[qi][t][s] = idle_players.shift(); } }
+        } else {
+          // move remaining to idle and remove match
+          const rem = queue_matches[qi].flat().filter(x=> x);
+          queue_matches.splice(qi,1);
+          rem.forEach(r=>{ if(!idle_players.some(x=> x.name===r.name) && r.ready) idle_players.unshift(r); });
+        }
+      }
+    }
+  }
+
+  // Persist and refresh display
+  // If player just became ready, attempt to prioritize them into matches
+  if(pl.ready){
+    // Option 1: try to swap into an existing queued match
+    let swapped = false;
+    for(let qi=0; qi<queue_matches.length && !swapped; qi++){
+      const qm = queue_matches[qi]; if(!qm) continue;
+      // try replacing each player in this queued match with the newly ready player
+      for(let t=0;t<2 && !swapped;t++){
+        for(let s=0;s<2 && !swapped;s++){
+          const candidate = qm[t][s];
+          if(!candidate) continue;
+          // require candidate has played at least 1 match (per user rule)
+          if((candidate.matches||0) < 1) continue;
+          // build a temporary group of 4 players where we replace candidate with pl
+          const group = qm.flat().map(p=> p && p.name === candidate.name ? pl : p);
+          // ensure no duplicate names
+          const names = group.map(x=> x? x.name : '').filter(Boolean);
+          if(new Set(names).size !== 4) continue;
+          // test if this grouping yields a valid match
+          const femaleCount = group.filter(x=> x && x.gender==='female').length;
+          const allowCross = (femaleCount % 2 === 1);
+          const m = best_match(group, allowCross);
+          if(!m) continue;
+          // ensure the match includes the new player
+          const includesNew = m.flat().some(p=> p && p.name === pl.name);
+          if(!includesNew) continue;
+          // perform the replacement in the queue: replace candidate with pl
+          queue_matches[qi] = m;
+          // put displaced candidate into idle (if ready)
+          if(!idle_players.some(x=> x.name === candidate.name) && candidate.ready) idle_players.unshift(candidate);
+          // remove pl from idle if present
+          const ip = idle_players.findIndex(x=> x.name === pl.name); if(ip !== -1) idle_players.splice(ip,1);
+          swapped = true; break;
+        }
+      }
+    }
+    // Option 2: if not swapped and enough idle players, try to form a new queued match including this player
+    if(!swapped){
+      updateIdlePlayers();
+      // ensure the new ready player is present in idle_players
+      if(!idle_players.some(x=> x.name === pl.name)) idle_players.unshift(pl);
+      if(idle_players.length >= 4){
+        const candidates = create_matches(idle_players);
+        for(const cand of candidates){
+          if(!cand) continue;
+          const names = cand.flat().map(p=> p? p.name : '');
+          if(names.includes(pl.name)){
+            // ensure none are assigned elsewhere
+            if(!anyNameAssignedOrQueued(names)){
+              queue_matches.unshift(cand);
+              // remove these players from idle
+              names.forEach(nm=>{ const idx = idle_players.findIndex(x=> x.name===nm); if(idx!==-1) idle_players.splice(idx,1); });
+              swapped = true; break;
+            }
+          }
+        }
+      }
+    }
+  }
+  saveState(); updateIdlePlayers(); render(); renderAdminPlayers();
 }
 
 if(document.getElementById('savePlayer')){

@@ -154,25 +154,25 @@
       </div>
     </div>
 
-    <!-- Score Modal -->
+    <!-- Result Modal -->
     <div class="modal fade" id="scoreModal" tabindex="-1">
       <div class="modal-dialog">
         <div class="modal-content">
           <div class="modal-header">
-            <h5 class="modal-title">Enter Score</h5>
+            <h5 class="modal-title">Enter Result</h5>
             <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
           </div>
           <div class="modal-body">
-            <form id="scoreForm">
-              <div class="mb-2">
-                <label class="form-label">Score (team1-team2)</label>
-                <input id="scoreInput" class="form-control" placeholder="21-18">
+            <div class="mb-2">
+              <p>Select the winning team for this court:</p>
+              <div class="d-flex flex-column">
+                <button id="modalTeam1" class="btn btn-outline-primary mb-2 btn-team-select" type="button">Team 1</button>
+                <button id="modalTeam2" class="btn btn-outline-primary btn-team-select" type="button">Team 2</button>
               </div>
-              <input type="hidden" id="modalCourtIdx">
-            </form>
+            </div>
+            <input type="hidden" id="modalCourtIdx">
           </div>
           <div class="modal-footer">
-            <button id="submitScore" type="button" class="btn btn-sm uniform-btn">Save</button>
             <button type="button" class="btn btn-sm uniform-btn" data-bs-dismiss="modal">Cancel</button>
           </div>
         </div>

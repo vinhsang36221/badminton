@@ -113,26 +113,78 @@ function onMatchDragOver(e){ e.preventDefault(); try{ e.dataTransfer.dropEffect 
 function onMatchDrop(e){
   e.preventDefault();
   const data = e.dataTransfer.getData('text/plain') || '';
-  if(!data.startsWith('match:')) return;
-  const parts = data.split(':'); const qidx = parseInt(parts[1],10);
-  if(isNaN(qidx)) return;
   // find court index from drop target (ancestor with data-court-index)
   let el = e.currentTarget || e.target;
   while(el && !(el.getAttribute && el.getAttribute('data-court-index'))) el = el.parentElement;
   if(!el) return;
   const ci = parseInt(el.getAttribute('data-court-index'),10);
   if(isNaN(ci)) return;
-  // remove the queued match (if still present at that index)
-  let removed = null;
-  if(qidx >=0 && qidx < queue_matches.length) removed = queue_matches.splice(qidx,1)[0];
-  else removed = queue_matches.shift();
-  if(!removed) return;
-  // if court currently occupied, push the existing active match to front of queue
-  if(active_matches[ci]){ queue_matches.unshift(active_matches[ci]); }
-  active_matches[ci] = removed;
-  processMatchPartners(active_matches[ci]);
-  saveState(); updateIdlePlayers(); render(); renderAdminPlayers();
-  logLine(`matchDrag: moved queued[${qidx}] -> court ${ci}`);
+
+  // If dragging a whole match (match:N), handle as before
+  if(data.startsWith('match:')){
+    const parts = data.split(':'); const qidx = parseInt(parts[1],10);
+    if(isNaN(qidx)) return;
+    let removed = null;
+    if(qidx >=0 && qidx < queue_matches.length) removed = queue_matches.splice(qidx,1)[0];
+    else removed = queue_matches.shift();
+    if(!removed) return;
+    if(active_matches[ci]){ queue_matches.unshift(active_matches[ci]); }
+    active_matches[ci] = removed;
+    processMatchPartners(active_matches[ci]);
+    saveState(); updateIdlePlayers(); render(); renderAdminPlayers();
+    logLine(`matchDrag: moved queued[${qidx}] -> court ${ci}`);
+    return;
+  }
+
+  // Otherwise, treat as player-level drop (queue: / idle: / court:)
+  const parts = data.split(':'); const srcType = parts[0];
+  // find destination slot element (data-loc) under the drop target if any
+  let tgt = e.target;
+  while(tgt && !(tgt.getAttribute && tgt.getAttribute('data-loc'))) tgt = tgt.parentElement;
+  const dstLoc = tgt && tgt.getAttribute ? tgt.getAttribute('data-loc') : null;
+
+  // If a specific dst slot found, perform swap
+  if(dstLoc){ try{ performSwap(data, dstLoc); }catch(err){ console.error('player drop failed', err); } saveState(); updateIdlePlayers(); render(); renderAdminPlayers(); logLine(`playerDrag: ${data} -> ${dstLoc}`); return; }
+
+  // No specific dst; place player into court ci (best effort)
+  if(srcType === 'queue' || srcType === 'idle' || srcType === 'court'){
+    // attempt to remove the player from source
+    const player = removePlayerFromLocation(data);
+    if(!player) return;
+    // If source was a queued match, and that match now has nulls, remove the queued match and restore remaining players to idle
+    if(srcType === 'queue'){
+      const qidx = parseInt(parts[1],10);
+      if(!isNaN(qidx) && queue_matches[qidx] && !queue_matches[qidx].flat().every(p=>p)){
+        const remaining = queue_matches[qidx].flat().filter(p=>p);
+        queue_matches.splice(qidx,1);
+        remaining.forEach(p=>{ if(!idle_players.some(x=>x.name===p.name) && !anyNameAssignedOrQueued([p.name])) idle_players.unshift(p); });
+      } else {
+        // cleanup any incomplete queued matches
+        const toRestore = [];
+        for(let i=queue_matches.length-1;i>=0;i--){ const m = queue_matches[i]; if(!m) continue; if(!m.flat().every(p=>p)){ const rem = m.flat().filter(p=>p); queue_matches.splice(i,1); rem.forEach(p=>{ if(!anyNameAssignedOrQueued([p.name])) toRestore.push(p); }); } }
+        toRestore.reverse().forEach(p=>{ if(!idle_players.some(x=>x.name===p.name)) idle_players.unshift(p); });
+      }
+    }
+
+    // Place into first available slot on court ci, or create a new partial match if court empty
+    if(!active_matches[ci]){ active_matches[ci] = [[player,null],[null,null]]; }
+    else {
+      let placed = false;
+      for(let team=0; team<2 && !placed; team++){
+        for(let pos=0; pos<2; pos++){
+          if(!active_matches[ci][team][pos]){ active_matches[ci][team][pos] = player; placed = true; break; }
+        }
+      }
+      if(!placed){
+        // no empty slot: replace first slot and put replaced player to idle
+        const replaced = active_matches[ci][0][0];
+        active_matches[ci][0][0] = player;
+        if(replaced && !idle_players.some(x=>x.name===replaced.name)) idle_players.unshift(replaced);
+      }
+    }
+    saveState(); updateIdlePlayers(); render(); renderAdminPlayers(); logLine(`playerDragPlace: ${player.name} -> court ${ci}`);
+    return;
+  }
 }
 
 function getPlayerAtLoc(loc){

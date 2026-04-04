@@ -53,6 +53,7 @@ function loadPlayersFromFile(callback) {
         recentTeammates: normalizeRecentHistory(p.recentTeammates),
         recentOpponents: normalizeRecentHistory(p.recentOpponents)
       }));
+      players.forEach(normalizePlayerPrefer);
       try { localStorage.setItem('badminton_players', JSON.stringify(players)); } catch (e) {}
       callback && callback();
     })
@@ -92,6 +93,8 @@ let wishPreferSelection = null;
 const MAX_COUPLE = 5;
 const MATCH_SELECTION_POOL_SIZE = 8;
 const MAX_CANDIDATE_GROUPS = 18;
+const MAX_SEED_ATTEMPTS = 2;
+const CHALLENGE_RESERVE_WINDOW = 4;
 
 // ============== CORE UTILITIES ==============
 
@@ -214,6 +217,36 @@ function getRecentNames(player, key) {
 function getRecentNamesWithinDepth(player, key, depth) {
   if (!player || !Number.isFinite(depth) || depth <= 0) return [];
   return Array.from(new Set(getRecentRounds(player, key).slice(0, depth).flat()));
+}
+
+function getEffectivePrefer(player) {
+  if (!player) return 'normal';
+  const prefer = player.prefer || 'normal';
+  if ((player.level || 0) <= 1) return 'normal';
+  return ['chill', 'normal', 'challenge'].includes(prefer) ? prefer : 'normal';
+}
+
+function normalizePlayerPrefer(player) {
+  if (!player) return;
+  player.prefer = getEffectivePrefer(player);
+}
+
+function groupMatchesSeedPrefer(seed, group) {
+  const effectivePrefer = getEffectivePrefer(seed);
+  if (!seed || effectivePrefer === 'normal') return true;
+
+  const others = (group || []).filter(player => player && player !== seed);
+  if (others.length !== 3) return false;
+
+  if (effectivePrefer === 'challenge') {
+    return others.every(player => player.level >= seed.level && player.level <= seed.level + 1);
+  }
+
+  if (effectivePrefer === 'chill') {
+    return others.every(player => player.level < seed.level);
+  }
+
+  return true;
 }
 
 function pushRecentRound(player, key, round) {
@@ -446,22 +479,8 @@ function computePartnerMatchPenalty(match) {
 }
 
 function computePreferMatchPenalty(match) {
-  if (!match || !match[0] || !match[1]) return 0;
-
-  let penalty = 0;
-  for (let teamIdx = 0; teamIdx < 2; teamIdx++) {
-    const ownTeam = match[teamIdx];
-    const otherTeam = match[1 - teamIdx];
-    const difficultyDelta = (team_rating(otherTeam) - team_rating(ownTeam)) / 100;
-
-    ownTeam.forEach(player => {
-      const prefer = player?.prefer || 'normal';
-      if (prefer === 'challenge') penalty -= difficultyDelta;
-      else if (prefer === 'chill') penalty += difficultyDelta;
-    });
-  }
-
-  return penalty;
+  // Prefer is now enforced as a seed-only grouping rule during match creation.
+  return 0;
 }
 
 function computePartnerStatePenalty(state) {
@@ -552,17 +571,9 @@ function scoreCandidateForSeed(seed, candidate) {
   return score;
 }
 
-function selectBestMatchFromPlayers(candidatePlayers, logContext = '', policyKey = 'strict2') {
-  if (!candidatePlayers || candidatePlayers.length < 4) return null;
-
-  const ranked = candidatePlayers.slice().sort((a, b) => {
-    const idleDiff = idleIndexOf(b) - idleIndexOf(a);
-    if (idleDiff !== 0) return idleDiff;
-    return (a.name || '').localeCompare(b.name || '');
-  });
-  const seed = ranked[0];
-  const supportPool = ranked
-    .slice(1)
+function buildSupportPoolForSeed(rankedPlayers, seed, poolLimit) {
+  return (rankedPlayers || [])
+    .filter(player => player !== seed)
     .map(player => ({ player, seedScore: scoreCandidateForSeed(seed, player) }))
     .sort((a, b) => {
       if (b.seedScore !== a.seedScore) return b.seedScore - a.seedScore;
@@ -570,16 +581,53 @@ function selectBestMatchFromPlayers(candidatePlayers, logContext = '', policyKey
       if (idleDiff !== 0) return idleDiff;
       return (a.player.name || '').localeCompare(b.player.name || '');
     })
-    .slice(0, Math.min(MATCH_SELECTION_POOL_SIZE, Math.max(3, ranked.length - 1)))
+    .slice(0, Math.min(poolLimit, Math.max(3, rankedPlayers.length - 1)))
     .map(entry => entry.player);
+}
 
-  const pool = [seed, ...supportPool];
+function getPoolExpansionSizes(totalPlayers) {
+  if (!Number.isFinite(totalPlayers) || totalPlayers <= 0) return [];
+
+  const poolSizes = [];
+  let size = Math.min(MATCH_SELECTION_POOL_SIZE, totalPlayers);
+
+  while (size < totalPlayers) {
+    poolSizes.push(size);
+    size *= 2;
+  }
+
+  poolSizes.push(totalPlayers);
+  return Array.from(new Set(poolSizes));
+}
+
+function selectBestMatchFromPlayers(candidatePlayers, options = {}) {
+  if (!candidatePlayers || candidatePlayers.length < 4) return null;
+
+  const {
+    logContext = '',
+    policyKey = 'strict2',
+    seed = null,
+    poolLimit = MATCH_SELECTION_POOL_SIZE,
+    verbose = false
+  } = options;
+
+  const ranked = candidatePlayers.slice().sort((a, b) => {
+    const idleDiff = idleIndexOf(b) - idleIndexOf(a);
+    if (idleDiff !== 0) return idleDiff;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+  const selectedSeed = seed || ranked[0];
+  if (!selectedSeed) return null;
+
+  const supportPool = buildSupportPoolForSeed(ranked, selectedSeed, poolLimit);
+  const pool = [selectedSeed, ...supportPool];
   const candidateGroups = [];
 
   for (let i = 1; i < pool.length - 2; i++) {
     for (let j = i + 1; j < pool.length - 1; j++) {
       for (let k = j + 1; k < pool.length; k++) {
-        const group = [seed, pool[i], pool[j], pool[k]];
+        const group = [selectedSeed, pool[i], pool[j], pool[k]];
+        if (!groupMatchesSeedPrefer(selectedSeed, group)) continue;
         if (countFemales(group) % 2 !== 0) continue;
         if (!groupRespectsAvailableCouples(group, candidatePlayers)) continue;
 
@@ -597,7 +645,7 @@ function selectBestMatchFromPlayers(candidatePlayers, logContext = '', policyKey
           idleScore: group.reduce((sum, player) => sum + idleIndexOf(player), 0),
           partnerPairs,
           couplePairs,
-          seedAffinity: scoreCandidateForSeed(seed, pool[i]) + scoreCandidateForSeed(seed, pool[j]) + scoreCandidateForSeed(seed, pool[k])
+          seedAffinity: scoreCandidateForSeed(selectedSeed, pool[i]) + scoreCandidateForSeed(selectedSeed, pool[j]) + scoreCandidateForSeed(selectedSeed, pool[k])
         });
       }
     }
@@ -613,13 +661,63 @@ function selectBestMatchFromPlayers(candidatePlayers, logContext = '', policyKey
 
   const shortlistedGroups = candidateGroups.slice(0, MAX_CANDIDATE_GROUPS);
 
-  if (logContext) logLine(`${logContext}:seed=${formatPlayer(seed)} supportPool=${supportPool.length} candidateGroups=${candidateGroups.length} shortlisted=${shortlistedGroups.length}`);
+  if (logContext) {
+    logLine(`${logContext}:attempt policy=${policyKey} seed=${formatPlayer(selectedSeed)} poolLimit=${supportPool.length} candidateGroups=${candidateGroups.length} shortlisted=${shortlistedGroups.length}`);
+  }
 
   for (let idx = 0; idx < shortlistedGroups.length; idx++) {
     const candidate = shortlistedGroups[idx];
-    if (logContext) logLine(`${logContext}:tryGroup#${idx + 1} idleScore=${candidate.idleScore} group=${formatGroup(candidate.group)}`);
-    const match = findBestMatch(candidate.group, logContext ? `${logContext}:${policyKey}` : '', policyKey);
-    if (match) return match;
+    if (verbose && logContext) logLine(`${logContext}:tryGroup#${idx + 1} idleScore=${candidate.idleScore} group=${formatGroup(candidate.group)}`);
+    const match = findBestMatch(candidate.group, verbose && logContext ? `${logContext}:${policyKey}` : '', policyKey);
+    if (match) {
+      return {
+        match,
+        seed: selectedSeed,
+        poolLimit: supportPool.length,
+        candidateGroupCount: candidateGroups.length,
+        shortlistedCount: shortlistedGroups.length
+      };
+    }
+  }
+
+  return {
+    match: null,
+    seed: selectedSeed,
+    poolLimit: supportPool.length,
+    candidateGroupCount: candidateGroups.length,
+    shortlistedCount: shortlistedGroups.length
+  };
+}
+
+function getChallengeReservePlan(rankedPlayers, policyKey, poolLimit) {
+  if (!rankedPlayers || rankedPlayers.length < 4) return null;
+
+  const reserveCandidates = rankedPlayers
+    .slice(0, Math.min(CHALLENGE_RESERVE_WINDOW, rankedPlayers.length))
+    .map((player, rankIndex) => ({ player, rankIndex }))
+    .filter(({ player, rankIndex }) => rankIndex >= MAX_SEED_ATTEMPTS && getEffectivePrefer(player) === 'challenge')
+    .sort((a, b) => {
+      const idleDiff = idleIndexOf(b.player) - idleIndexOf(a.player);
+      if (idleDiff !== 0) return idleDiff;
+      return a.rankIndex - b.rankIndex;
+    });
+
+  for (const candidate of reserveCandidates) {
+    const result = selectBestMatchFromPlayers(rankedPlayers, {
+      policyKey,
+      seed: candidate.player,
+      poolLimit,
+      verbose: false
+    });
+
+    if (!result || !result.match) continue;
+
+    return {
+      challenge: candidate.player,
+      rankIndex: candidate.rankIndex,
+      result,
+      reserveNames: new Set(result.match.flat().filter(Boolean).map(player => player.name))
+    };
   }
 
   return null;
@@ -1682,14 +1780,51 @@ function createNewMatch() {
   const policySequence = emptyCourts >= 2
     ? ['strict2', 'strict1', 'skipRule3', 'skipRule2And3']
     : ['strict2'];
-  logLine(`createNewMatch:start idleCount=${idle_players.length} seed=${formatPlayer(ranked[0])} emptyCourts=${emptyCourts} policies=${policySequence.join('>')}`);
+  const poolSizes = getPoolExpansionSizes(Math.max(0, ranked.length - 1));
+  const initialSeedCandidates = ranked.slice(0, Math.min(MAX_SEED_ATTEMPTS, ranked.length));
+  logLine(`createNewMatch:start idleCount=${idle_players.length} seeds=${initialSeedCandidates.map(formatPlayer).join(', ')} emptyCourts=${emptyCourts} policies=${policySequence.join('>')} poolSizes=${poolSizes.join('>')}`);
+
+  let challengeFallback = null;
 
   for (const policyKey of policySequence) {
-    const match = selectBestMatchFromPlayers(ranked, 'createNewMatch', policyKey);
-    if (!match) continue;
+    for (const poolSize of poolSizes) {
+      const reservePlan = getChallengeReservePlan(ranked, policyKey, poolSize);
+      if (reservePlan && !challengeFallback) {
+        challengeFallback = { policyKey, poolSize, reservePlan };
+      }
+
+      const candidatePool = reservePlan
+        ? ranked.filter(player => !reservePlan.reserveNames.has(player.name))
+        : ranked;
+      const seedCandidates = candidatePool.slice(0, Math.min(MAX_SEED_ATTEMPTS, candidatePool.length));
+
+      for (let seedIdx = 0; seedIdx < seedCandidates.length; seedIdx++) {
+        const result = selectBestMatchFromPlayers(candidatePool, {
+          logContext: 'createNewMatch',
+          policyKey,
+          seed: seedCandidates[seedIdx],
+          poolLimit: poolSize,
+          verbose: false
+        });
+        if (!result || !result.match) continue;
+
+        if (policyKey !== 'strict2') logLine(`createNewMatch:fallbackApplied policy=${policyKey} emptyCourts=${emptyCourts}`);
+        if (poolSize > MATCH_SELECTION_POOL_SIZE) logLine(`createNewMatch:poolExpanded seed=${formatPlayer(result.seed)} poolLimit=${result.poolLimit}`);
+        if (seedIdx > 0) logLine(`createNewMatch:alternateSeed seed=${formatPlayer(result.seed)} rankIndex=${seedIdx}`);
+        if (reservePlan) logLine(`createNewMatch:challengeHeld challenge=${formatPlayer(reservePlan.challenge)} rankIndex=${reservePlan.rankIndex} reserved=${Array.from(reservePlan.reserveNames).join(', ')}`);
+        logLine(`createNewMatch:selected match=${formatMatch(result.match)}`);
+        return result.match;
+      }
+    }
+  }
+
+  if (challengeFallback && challengeFallback.reservePlan?.result?.match) {
+    const { policyKey, poolSize, reservePlan } = challengeFallback;
     if (policyKey !== 'strict2') logLine(`createNewMatch:fallbackApplied policy=${policyKey} emptyCourts=${emptyCourts}`);
-    logLine(`createNewMatch:selected match=${formatMatch(match)}`);
-    return match;
+    if (poolSize > MATCH_SELECTION_POOL_SIZE) logLine(`createNewMatch:poolExpanded seed=${formatPlayer(reservePlan.result.seed)} poolLimit=${reservePlan.result.poolLimit}`);
+    logLine(`createNewMatch:challengeFallback challenge=${formatPlayer(reservePlan.challenge)} rankIndex=${reservePlan.rankIndex}`);
+    logLine(`createNewMatch:selected match=${formatMatch(reservePlan.result.match)}`);
+    return reservePlan.result.match;
   }
 
   logLine('createNewMatch:noMatchFound');
@@ -1815,6 +1950,7 @@ function updateIdlePlayers() {
 }
 
 function saveState() {
+  players.forEach(normalizePlayerPrefer);
   localStorage.setItem('badminton_players', JSON.stringify(players));
   localStorage.setItem('badminton_history', JSON.stringify(match_history));
   saveLayoutState();
@@ -1840,6 +1976,7 @@ function loadState() {
         recentTeammates: normalizeRecentHistory(p0.recentTeammates),
         recentOpponents: normalizeRecentHistory(p0.recentOpponents)
       }));
+      players.forEach(normalizePlayerPrefer);
     } catch (e) { console.error('failed to parse players', e); }
   }
 
@@ -1860,6 +1997,7 @@ function renderAdminPlayers() {
   box.innerHTML = '';
 
   const preferOrder = ['chill', 'normal', 'challenge'];
+  let draggedPlayerIndex = null;
 
   players.forEach((p, idx) => {
     const row = document.createElement('div');
@@ -1868,7 +2006,7 @@ function renderAdminPlayers() {
     const readyBtnClass = p.ready ? 'btn-ready' : 'btn-notready';
     const readySymbol = p.ready ? 'V' : 'X';
     const genderLabel = p.gender === 'female' ? 'Female' : 'Male';
-    const pref = p.prefer || 'normal';
+    const pref = getEffectivePrefer(p);
     const prefClass = pref === 'chill' ? 'prefer-chill' : (pref === 'challenge' ? 'prefer-challenge' : 'prefer-normal');
     const prefLabel = pref.charAt(0).toUpperCase() + pref.slice(1);
     const partnerLabel = p.partnerSlot || 'No Partner';
@@ -1877,23 +2015,71 @@ function renderAdminPlayers() {
     const unpairLabel = p.unpair ? ('No' + p.unpair) : 'Normal';
 
     row.innerHTML = `
-      <div class="admin-row">
-        <div class="admin-left"><strong>${p.name}</strong></div>
-        <div class="admin-edit">
-          <button class="btn btn-sm btn-outline-secondary" data-idx="${idx}" data-action="edit">Edit</button>
-        </div>
-        <div class="admin-right">
-          <button class="btn btn-sm gender-btn ${p.gender === 'female' ? 'btn-female' : 'btn-male'}" data-idx="${idx}" data-action="toggleGender">${genderLabel}</button>
-          <button class="btn btn-sm btn-level" data-idx="${idx}" data-action="toggleLevel">L${p.level}</button>
-          <button class="btn btn-sm ${readyBtnClass}" data-idx="${idx}" data-action="toggleReady">${readySymbol}</button>
-          <button class="btn btn-sm ${prefClass} ms-1 prefer-btn" data-idx="${idx}" data-action="togglePrefer">${prefLabel}</button>
-          <button class="btn btn-sm partner-btn ms-2" data-idx="${idx}" data-action="partnerToggle">${partnerLabel}</button>
-          <button class="btn btn-sm ${coupleClass} ms-2" data-idx="${idx}" data-action="toggleType">${coupleLabel}</button>
-          <button class="btn btn-sm btn-uncouple ms-2" data-idx="${idx}" data-action="toggleUnpair">${unpairLabel}</button>
-          <button class="btn btn-sm uniform-btn btn-delete ms-2" data-idx="${idx}" data-action="delete">Del</button>
+      <div class="admin-row admin-row--draggable" draggable="true" data-player-index="${idx}">
+        <div class="admin-left"><span class="drag-handle" aria-hidden="true">::</span><strong class="admin-player-name">${p.name}</strong></div>
+        <div class="admin-actions">
+          <div class="admin-edit">
+            <button draggable="false" class="btn btn-sm btn-outline-secondary" data-idx="${idx}" data-action="edit">Edit</button>
+          </div>
+          <div class="admin-right">
+            <button draggable="false" class="btn btn-sm gender-btn ${p.gender === 'female' ? 'btn-female' : 'btn-male'}" data-idx="${idx}" data-action="toggleGender">${genderLabel}</button>
+            <button draggable="false" class="btn btn-sm btn-level" data-idx="${idx}" data-action="toggleLevel">L${p.level}</button>
+            <button draggable="false" class="btn btn-sm ${readyBtnClass}" data-idx="${idx}" data-action="toggleReady">${readySymbol}</button>
+            <button draggable="false" class="btn btn-sm ${prefClass} ms-1 prefer-btn" data-idx="${idx}" data-action="togglePrefer">${prefLabel}</button>
+            <button draggable="false" class="btn btn-sm partner-btn ms-2" data-idx="${idx}" data-action="partnerToggle">${partnerLabel}</button>
+            <button draggable="false" class="btn btn-sm ${coupleClass} ms-2" data-idx="${idx}" data-action="toggleType">${coupleLabel}</button>
+            <button draggable="false" class="btn btn-sm btn-uncouple ms-2" data-idx="${idx}" data-action="toggleUnpair">${unpairLabel}</button>
+            <button draggable="false" class="btn btn-sm uniform-btn btn-delete ms-2" data-idx="${idx}" data-action="delete">Del</button>
+          </div>
         </div>
       </div>`;
     box.appendChild(row);
+  });
+
+  box.querySelectorAll('.admin-row[data-player-index]').forEach(row => {
+    row.addEventListener('dragstart', event => {
+      draggedPlayerIndex = parseInt(row.getAttribute('data-player-index'), 10);
+      row.classList.add('admin-row--dragging');
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', String(draggedPlayerIndex));
+      }
+    });
+
+    row.addEventListener('dragend', () => {
+      draggedPlayerIndex = null;
+      box.querySelectorAll('.admin-row--dragging, .admin-row--dragover').forEach(el => {
+        el.classList.remove('admin-row--dragging', 'admin-row--dragover');
+      });
+    });
+
+    row.addEventListener('dragover', event => {
+      event.preventDefault();
+      if (draggedPlayerIndex === null) return;
+      row.classList.add('admin-row--dragover');
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+    });
+
+    row.addEventListener('dragleave', () => {
+      row.classList.remove('admin-row--dragover');
+    });
+
+    row.addEventListener('drop', event => {
+      event.preventDefault();
+      row.classList.remove('admin-row--dragover');
+
+      const targetIndex = parseInt(row.getAttribute('data-player-index'), 10);
+      const sourceIndex = draggedPlayerIndex;
+      if (!Number.isInteger(sourceIndex) || !Number.isInteger(targetIndex) || sourceIndex === targetIndex) return;
+
+      const [movedPlayer] = players.splice(sourceIndex, 1);
+      if (!movedPlayer) return;
+      players.splice(targetIndex, 0, movedPlayer);
+
+      saveState();
+      render();
+      renderAdminPlayers();
+    });
   });
 
   box.querySelectorAll('button[data-action]').forEach(btn => {
@@ -1910,11 +2096,13 @@ function renderAdminPlayers() {
       } else if (action === 'toggleLevel') {
         players[idx].level = (players[idx].level % 10) + 1;
         players[idx].rating = players[idx].level * 100;
+        normalizePlayerPrefer(players[idx]);
         saveState(); render(); renderAdminPlayers();
       } else if (action === 'togglePrefer') {
-        const current = players[idx].prefer || 'normal';
+        const current = getEffectivePrefer(players[idx]);
         const currentIndex = preferOrder.indexOf(current);
         players[idx].prefer = preferOrder[(currentIndex + 1 + preferOrder.length) % preferOrder.length];
+        normalizePlayerPrefer(players[idx]);
         saveState(); render(); renderAdminPlayers();
       } else if (action === 'partnerToggle') {
         const order = ['', 'P1', 'P2', 'P3', 'P4', 'P5'];
@@ -1952,15 +2140,39 @@ function renderAdminPlayers() {
 
 // ============== EXPORT/IMPORT ==============
 
-function exportJSON() {
-  const state = {
-    players: players,
-    match_history: match_history,
-    active_matches: active_matches.map(m => m ? [[m[0][0].name, m[0][1].name], [m[1][0].name, m[1][1].name]] : null),
-    queue_matches: queue_matches.map(m => m ? [[m[0][0].name, m[0][1].name], [m[1][0].name, m[1][1].name]] : null),
-    idle_players: idle_players.map(p => p.name)
+function buildExportPlayerSnapshot(player) {
+  normalizePlayerPrefer(player);
+  return {
+    name: player.name,
+    level: player.level || 4,
+    gender: player.gender || 'male',
+    prefer: getEffectivePrefer(player),
+    rating: player.rating !== undefined ? player.rating : ((player.level || 4) * 100),
+    matches: player.matches || 0,
+    ready: player.ready === undefined ? true : player.ready,
+    idleIndex: Number.isFinite(Number(player.idleIndex)) ? Math.max(0, Math.floor(Number(player.idleIndex))) : 0,
+    couple: player.couple === undefined ? null : player.couple,
+    unpair: player.unpair === undefined ? null : player.unpair,
+    partnerSlot: player.partnerSlot === undefined ? null : player.partnerSlot,
+    recentTeammates: normalizeRecentHistory(player.recentTeammates),
+    recentOpponents: normalizeRecentHistory(player.recentOpponents)
   };
-  const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+}
+
+function stringifyExportPlayers(playersToExport) {
+  const lines = ['{', '  "players": ['];
+  playersToExport.forEach((player, idx) => {
+    const suffix = idx < playersToExport.length - 1 ? ',' : '';
+    lines.push(`    ${JSON.stringify(player)}${suffix}`);
+  });
+  lines.push('  ]');
+  lines.push('}');
+  return lines.join('\n');
+}
+
+function exportJSON() {
+  const exportedPlayers = players.map(buildExportPlayerSnapshot);
+  const blob = new Blob([stringifyExportPlayers(exportedPlayers)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -2120,7 +2332,7 @@ if (document.getElementById('wishPlayerSelect')) {
     const value = e.target.value;
     const selectedPlayerIndex = value === '' ? null : parseInt(value, 10);
     const selectedPlayer = Number.isInteger(selectedPlayerIndex) ? players[selectedPlayerIndex] : null;
-    setWishPreferSelection(selectedPlayer?.prefer || null);
+    setWishPreferSelection(getEffectivePrefer(selectedPlayer));
     populateWishPartnerOptions(Number.isInteger(selectedPlayerIndex) ? selectedPlayerIndex : null);
   };
 }
@@ -2144,6 +2356,7 @@ if (document.getElementById('wishSetPrefer')) {
     }
 
     players[playerIndex].prefer = wishPreferSelection;
+    normalizePlayerPrefer(players[playerIndex]);
     saveState();
     render();
     renderAdminPlayers();
@@ -2228,73 +2441,58 @@ if (document.getElementById('downloadHistory')) document.getElementById('downloa
 if (document.getElementById('clearHistory')) document.getElementById('clearHistory').onclick = clearHistory;
 
 // Add player form
-if (document.getElementById('savePlayer')) {
-  document.getElementById('savePlayer').onclick = () => {
-    const name = document.getElementById('pName').value.trim();
-    if (!name) return alert('Name required');
-    const level = parseInt(document.getElementById('pLevel').value) || 4;
-    const gender = document.getElementById('pGender').value || 'male';
-    const prefer = document.getElementById('pPrefer').value || 'normal';
-    
-    players.push({
-      name,
-      level,
-      gender,
-      prefer,
-      rating: level * 100,
-      matches: 0,
-      ready: true,
-      idleIndex: 0,
-      couple: null,
-      unpair: null,
-      partnerSlot: null,
-      recentTeammates: [],
-      recentOpponents: []
-    });
-    
-    document.getElementById('pName').value = '';
-    document.getElementById('pLevel').value = '';
-    document.getElementById('pGender').value = 'male';
-    document.getElementById('pPrefer').value = 'normal';
-    
-    saveState();
-    updateIdlePlayers();
-    render();
-    renderAdminPlayers();
+function handleAddPlayer(event) {
+  if (event) event.preventDefault();
+
+  const nameInput = document.getElementById('pName');
+  const levelInput = document.getElementById('pLevel');
+  const genderInput = document.getElementById('pGender');
+  const preferInput = document.getElementById('pPrefer');
+  if (!nameInput || !levelInput || !genderInput || !preferInput) return;
+
+  const name = nameInput.value.trim();
+  if (!name) return alert('Name required');
+
+  const parsedLevel = parseInt(levelInput.value, 10);
+  const level = Number.isFinite(parsedLevel) ? parsedLevel : 4;
+  const gender = genderInput.value || 'male';
+  const prefer = preferInput.value || 'normal';
+
+  const player = {
+    name,
+    level,
+    gender,
+    prefer,
+    rating: level * 100,
+    matches: 0,
+    ready: true,
+    idleIndex: 0,
+    couple: null,
+    unpair: null,
+    partnerSlot: null,
+    recentTeammates: [],
+    recentOpponents: []
   };
+  normalizePlayerPrefer(player);
+  players.push(player);
+
+  nameInput.value = '';
+  levelInput.value = '';
+  genderInput.value = 'male';
+  preferInput.value = 'normal';
+
+  saveState();
+  updateIdlePlayers();
+  render();
+  renderAdminPlayers();
+}
+
+if (document.getElementById('playerFormTop')) {
+  document.getElementById('playerFormTop').addEventListener('submit', handleAddPlayer);
+}
+if (document.getElementById('savePlayer')) {
+  document.getElementById('savePlayer').onclick = handleAddPlayer;
 }
 if (document.getElementById('savePlayerTop')) {
-  document.getElementById('savePlayerTop').onclick = () => {
-    const name = document.getElementById('pName').value.trim();
-    if (!name) return alert('Name required');
-    const level = parseInt(document.getElementById('pLevel').value) || 4;
-    const gender = document.getElementById('pGender').value || 'male';
-    const prefer = document.getElementById('pPrefer').value || 'normal';
-    
-    players.push({
-      name,
-      level,
-      gender,
-      prefer,
-      rating: level * 100,
-      matches: 0,
-      ready: true,
-      idleIndex: 0,
-      couple: null,
-      unpair: null,
-      partnerSlot: null,
-      recentTeammates: [],
-      recentOpponents: []
-    });
-    
-    document.getElementById('pName').value = '';
-    document.getElementById('pLevel').value = '';
-    document.getElementById('pGender').value = 'male';
-    document.getElementById('pPrefer').value = 'normal';
-    
-    saveState();
-    updateIdlePlayers();
-    render();
-    renderAdminPlayers();
-  };
+  document.getElementById('savePlayerTop').onclick = handleAddPlayer;
 }

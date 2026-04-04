@@ -67,8 +67,14 @@ body { font-size: 14px; }
 .prefer-challenge { background-color: #ffb3b3 !important; color: #600000 !important; }
 
 /* Admin player list alignment */
-.admin-row{ display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 6px; }
-.admin-left{ display:flex; align-items:center; gap:4px; min-width:90px; flex: 1 1 auto; }
+.admin-row{ display:grid; grid-template-columns: minmax(120px, 150px) auto; align-items:center; gap:6px; padding:4px 6px; width:100%; }
+.admin-row--draggable{ cursor: grab; border-radius: 6px; transition: background-color 120ms ease, opacity 120ms ease; }
+.admin-row--dragging{ opacity: 0.45; }
+.admin-row--dragover{ background-color: #eef6ff; outline: 1px dashed #7aa7d9; }
+.admin-left{ display:flex; align-items:center; gap:4px; min-width:0; overflow:hidden; padding-right:4px; }
+.admin-player-name{ display:inline-block; min-width:0; max-width:100%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.drag-handle{ display:inline-flex; align-items:center; justify-content:center; min-width:16px; color:#6c757d; font-weight:700; letter-spacing:1px; user-select:none; }
+.admin-actions{ display:flex; align-items:center; gap:10px; flex:0 0 auto; white-space:nowrap; }
 .admin-edit{ display:flex; align-items:center; justify-content:center; flex: 0 0 60px; }
 .admin-right{ display:flex; align-items:center; gap:6px; flex: 0 0 auto; }
 .admin-right .btn{ min-width:48px; }
@@ -89,7 +95,7 @@ body { font-size: 14px; }
 .admin-panel .panel-body{ flex:1 1 auto; overflow:auto; }
 
 /* For panels where scrolling isn't desired (e.g., Add Player) */
-.admin-panel--no-scroll { height: auto; max-width: none; width: 111%; }
+.admin-panel--no-scroll { height: auto; max-width: none; width: 100%; }
 .admin-panel--no-scroll .panel-body { overflow: visible; }
 
 /* Keep the Add button compact and flush with the adjacent select */
@@ -102,14 +108,13 @@ body { font-size: 14px; }
 .no-stretch-row { align-items: flex-start; }
 
 /* Add Player form: distribute controls and keep Add button flush-right */
-.add-player-form{ display:flex; align-items:center; justify-content:space-between; gap:6px; flex-wrap:nowrap; }
-.add-player-form .fp-name{ flex: 0 0 23%; }
-.add-player-form .fp-level{ flex: 0 0 23%; }
-.add-player-form .fp-gender{ flex: 0 0 23%; }
-.add-player-form .fp-prefer{ flex: 0 0 23%; }
-.add-player-form .fp-add{ flex: 0 0 auto; display:flex; justify-content:flex-end; }
-.add-player-form .fp-add{ margin-left: auto; }
-.add-player-form .fp-add{ flex: 0 0 auto; }
+.add-player-form{ display:grid; grid-template-columns: minmax(180px, 1.7fr) minmax(90px, 0.8fr) minmax(110px, 1fr) minmax(120px, 1fr) auto; align-items:center; gap:6px; }
+.add-player-form .fp-name,
+.add-player-form .fp-level,
+.add-player-form .fp-gender,
+.add-player-form .fp-prefer,
+.add-player-form .fp-add{ min-width: 0; }
+.add-player-form .fp-add{ display:flex; justify-content:flex-end; }
 .add-player-form .form-control, .add-player-form .form-select{ width:100%; }
 
 /* Compact right panel that should not stretch to full column height */
@@ -136,8 +141,13 @@ body { font-size: 14px; }
 
 /* make admin player rows responsive on small screens to avoid overlap */
 @media (max-width: 767.98px){
-	.admin-row{ flex-direction:column; align-items:flex-start; padding:4px 4px; }
-	.admin-left{ min-width:0; margin-bottom:6px; }
+	.add-player-form{ grid-template-columns: 1fr; }
+	.add-player-form .fp-add{ justify-content:stretch; }
+	.add-player-form .fp-add .btn{ width:100%; }
+	.admin-row{ grid-template-columns: 1fr; align-items:flex-start; padding:4px 4px; }
+	.admin-left{ min-width:0; padding-right:0; margin-bottom:6px; }
+	.admin-actions{ width:100%; display:flex; flex-direction:column; align-items:stretch; gap:6px; }
+	.admin-edit{ justify-content:flex-start; flex:0 0 auto; }
 	.admin-right{ width:100%; display:flex; flex-wrap:wrap; gap:6px; }
 	.admin-right .btn{ min-width:0; flex: 1 1 auto; }
 	/* prefer button should still visually align but allow wrapping */

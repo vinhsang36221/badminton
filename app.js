@@ -6,7 +6,8 @@
 // 4. Idle Index priority: prioritize players waiting longer in Idle
 // 5. Equal Level Team: after selecting 4 players, swap pairings inside that group to make team levels as close as possible
 
-let COURTS = 3;
+const COURT_NUMBERS = [9, 10, 11, 12];
+let COURTS = COURT_NUMBERS.length;
 let players = [];
 const RECENT_APPEARANCE_LIMIT = 2;
 const RECENT_RULE_POLICIES = {
@@ -38,22 +39,8 @@ function loadPlayersFromFile(callback) {
 
   attemptFetch(tryUrls, 0)
     .then(data => {
-      players = data.map(p => ({
-        name: p.name,
-        level: p.level || 4,
-        gender: p.gender || 'male',
-        prefer: p.prefer || 'normal',
-        rating: p.rating !== undefined ? p.rating : ((p.level || 4) * 100),
-        matches: p.matches || 0,
-        ready: p.ready === undefined ? true : p.ready,
-        idleIndex: Number.isFinite(Number(p.idleIndex)) ? Math.max(0, Math.floor(Number(p.idleIndex))) : 0,
-        couple: p.couple === undefined ? null : p.couple,
-        unpair: p.unpair === undefined ? (p.uncouple === undefined ? null : p.uncouple) : p.unpair,
-        partnerSlot: p.partnerSlot === undefined ? null : p.partnerSlot,
-        recentTeammates: normalizeRecentHistory(p.recentTeammates),
-        recentOpponents: normalizeRecentHistory(p.recentOpponents)
-      }));
-      players.forEach(normalizePlayerPrefer);
+      players = data.map(normalizePlayerRecord);
+      finalizePlayerRecords(players);
       try { localStorage.setItem('badminton_players', JSON.stringify(players)); } catch (e) {}
       callback && callback();
     })
@@ -90,17 +77,357 @@ let queue_matches = [];
 let idle_players = [];
 let debug_log = [];
 let wishPreferSelection = null;
+let autoSyncLevelsFromRating = true;
+let courtEnabledStates = Array(COURTS).fill(true);
 const MAX_COUPLE = 5;
 const MATCH_SELECTION_POOL_SIZE = 8;
 const MAX_CANDIDATE_GROUPS = 18;
 const MAX_SEED_ATTEMPTS = 2;
 const CHALLENGE_RESERVE_WINDOW = 4;
 
+function createPlayerId() {
+  return `player_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function ensurePlayerId(player) {
+  if (!player) return null;
+  if (!player.id) player.id = createPlayerId();
+  return player.id;
+}
+
+function getPlayerRef(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return ensurePlayerId(value);
+  return value;
+}
+
+function getCourtLabel(index) {
+  return `Sân ${COURT_NUMBERS[index] ?? (index + 1)}`;
+}
+
+function ensureCourtEnabledStates() {
+  if (!Array.isArray(courtEnabledStates)) courtEnabledStates = [];
+  courtEnabledStates = COURT_NUMBERS.map((_, index) => courtEnabledStates[index] !== false);
+}
+
+function isCourtEnabled(index) {
+  ensureCourtEnabledStates();
+  return courtEnabledStates[index] !== false;
+}
+
+function getFirstAvailableEnabledCourtIndex() {
+  ensureCourtEnabledStates();
+  return (active_matches || []).findIndex((match, index) => isCourtEnabled(index) && !match);
+}
+
+function relocateDisabledCourtMatches(logPrefix = 'courtToggle') {
+  ensureCourtEnabledStates();
+  const displacedMatches = [];
+
+  for (let index = 0; index < COURTS; index++) {
+    if (isCourtEnabled(index) || !active_matches[index]) continue;
+    displacedMatches.push({ index, match: active_matches[index] });
+    active_matches[index] = null;
+  }
+
+  if (!displacedMatches.length) return;
+
+  const queuedFirst = [];
+  displacedMatches.forEach(({ index, match }) => {
+    const emptyCourtIdx = getFirstAvailableEnabledCourtIndex();
+    if (emptyCourtIdx !== -1) {
+      active_matches[emptyCourtIdx] = match;
+      logLine(`${logPrefix}:moveMatch from=${getCourtLabel(index)} to=${getCourtLabel(emptyCourtIdx)} match=${formatMatch(match)}`);
+      return;
+    }
+    queuedFirst.push(match);
+    logLine(`${logPrefix}:queueMatch from=${getCourtLabel(index)} match=${formatMatch(match)}`);
+  });
+
+  if (queuedFirst.length) queue_matches = [...queuedFirst, ...(queue_matches || [])];
+}
+
+function promoteQueueMatchesToEnabledCourts(logPrefix = 'queuePromote') {
+  while ((queue_matches || []).length > 0) {
+    const emptyCourtIdx = getFirstAvailableEnabledCourtIndex();
+    if (emptyCourtIdx === -1) break;
+    active_matches[emptyCourtIdx] = queue_matches.shift();
+    logLine(`${logPrefix}:court=${getCourtLabel(emptyCourtIdx)} match=${formatMatch(active_matches[emptyCourtIdx])}`);
+  }
+}
+
+function setCourtEnabledState(index, enabled) {
+  ensureCourtEnabledStates();
+  courtEnabledStates[index] = !!enabled;
+  if (!courtEnabledStates[index]) relocateDisabledCourtMatches('court:disable');
+}
+
+function samePlayer(a, b) {
+  const aRef = getPlayerRef(a);
+  const bRef = getPlayerRef(b);
+  return aRef !== null && bRef !== null && aRef === bRef;
+}
+
+function buildPlayerLookups(sourcePlayers = players) {
+  const byId = new Map();
+  const byName = new Map();
+  (sourcePlayers || []).forEach(player => {
+    if (!player) return;
+    const id = ensurePlayerId(player);
+    if (id) byId.set(id, player);
+    if (player.name) byName.set(player.name, player);
+  });
+  return { byId, byName };
+}
+
+function findPlayerByRef(ref, sourcePlayers = players) {
+  if (!ref) return null;
+  const { byId, byName } = buildPlayerLookups(sourcePlayers);
+  return byId.get(ref) || byName.get(ref) || null;
+}
+
+function normalizeRecentHistoryRefs(value, byName) {
+  return normalizeRecentHistory(value).map(round => {
+    const refs = round.map(ref => {
+      if (!ref) return null;
+      const player = byName && byName.get(ref);
+      return player ? ensurePlayerId(player) : ref;
+    }).filter(Boolean);
+    return Array.from(new Set(refs));
+  }).filter(round => round.length).slice(0, RECENT_APPEARANCE_LIMIT);
+}
+
+function normalizePlayerRecord(rawPlayer) {
+  const player = {
+    id: rawPlayer.id || createPlayerId(),
+    name: rawPlayer.name,
+    level: rawPlayer.level || 4,
+    gender: rawPlayer.gender || 'male',
+    prefer: rawPlayer.prefer || 'normal',
+    rating: rawPlayer.rating !== undefined ? rawPlayer.rating : ((rawPlayer.level || 4) * 100),
+    matches: rawPlayer.matches || 0,
+    ready: rawPlayer.ready === undefined ? true : rawPlayer.ready,
+    idleIndex: Number.isFinite(Number(rawPlayer.idleIndex)) ? Math.max(0, Math.floor(Number(rawPlayer.idleIndex))) : 0,
+    couple: rawPlayer.couple === undefined ? null : rawPlayer.couple,
+    unpair: rawPlayer.unpair === undefined ? (rawPlayer.uncouple === undefined ? null : rawPlayer.uncouple) : rawPlayer.unpair,
+    unpairMain: rawPlayer.unpairMain === undefined ? false : !!rawPlayer.unpairMain,
+    partnerSlot: rawPlayer.partnerSlot === undefined ? null : rawPlayer.partnerSlot,
+    recentTeammates: normalizeRecentHistory(rawPlayer.recentTeammates),
+    recentOpponents: normalizeRecentHistory(rawPlayer.recentOpponents)
+  };
+  return player;
+}
+
+function levelBaseRating(level) {
+  const parsedLevel = Number.isFinite(Number(level)) ? Number(level) : 4;
+  return parsedLevel * 100;
+}
+
+function getPlayerRating(player) {
+  if (!player) return 0;
+  return Number.isFinite(Number(player.rating)) ? Number(player.rating) : levelBaseRating(player.level || 4);
+}
+
+function getPlayerAccumulatedRating(player) {
+  if (!player) return 0;
+  return getPlayerRating(player) - levelBaseRating(player.level || 4);
+}
+
+function setPlayerLevelWithAccumulatedRating(player, nextLevel, options = {}) {
+  if (!player) return;
+  const { resetAccumulated = false } = options;
+  const accumulated = resetAccumulated ? 0 : getPlayerAccumulatedRating(player);
+  player.level = nextLevel;
+  player.rating = levelBaseRating(nextLevel) + accumulated;
+}
+
+function resetPlayerAccumulatedRating(player) {
+  if (!player) return;
+  player.rating = levelBaseRating(player.level || 4);
+}
+
+function formatSignedRating(value) {
+  const numericValue = Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
+  if (numericValue > 0) return `+${numericValue}`;
+  if (numericValue < 0) return `${numericValue}`;
+  return '0';
+}
+
+function buildSelectOptions(options, currentValue) {
+  return options.map(option => {
+    const value = option.value === undefined || option.value === null ? '' : String(option.value);
+    const selected = String(currentValue ?? '') === value ? ' selected' : '';
+    return `<option value="${value}"${selected}>${option.label}</option>`;
+  }).join('');
+}
+
+function getPartnerSlotOptions() {
+  const usedSlots = new Set(
+    (players || [])
+      .map(player => player?.partnerSlot)
+      .filter(Boolean)
+  );
+  const numericSlots = Array.from(usedSlots)
+    .map(slot => /^P(\d+)$/.exec(String(slot)))
+    .filter(Boolean)
+    .map(match => parseInt(match[1], 10));
+  const maxSlot = Math.max(MAX_COUPLE, numericSlots.length ? Math.max(...numericSlots) : 0);
+  const options = [{ value: '', label: 'No Partner' }];
+  for (let idx = 1; idx <= maxSlot; idx++) {
+    options.push({ value: `P${idx}`, label: `P${idx}` });
+  }
+  return options;
+}
+
+function getCoupleOptions() {
+  const options = [{ value: '', label: 'Single' }];
+  for (let idx = 1; idx <= MAX_COUPLE; idx++) {
+    options.push({ value: String(idx), label: `C${idx}` });
+  }
+  return options;
+}
+
+function getUnpairOptions() {
+  const options = [{ value: '', label: 'Normal' }];
+  for (let idx = 1; idx <= MAX_COUPLE; idx++) {
+    options.push({ value: `${idx}:main`, label: `No${idx}.Main` });
+    options.push({ value: `${idx}:member`, label: `No${idx}.Member` });
+  }
+  return options;
+}
+
+function getUnpairSelectValue(player) {
+  const groupId = playerFlagValue(player, 'unpair');
+  if (groupId === null) return '';
+  return `${groupId}:${player.unpairMain ? 'main' : 'member'}`;
+}
+
+function setPlayerPartnerSlot(player, value) {
+  if (!player) return;
+  player.partnerSlot = value ? String(value) : null;
+}
+
+function setPlayerCoupleValue(player, value) {
+  if (!player) return;
+  const parsed = parseInt(value, 10);
+  player.couple = Number.isFinite(parsed) ? parsed : null;
+}
+
+function setPlayerUnpairValue(player, value) {
+  if (!player) return;
+  if (!value) {
+    player.unpair = null;
+    player.unpairMain = false;
+    return;
+  }
+
+  const [groupRaw, roleRaw] = String(value).split(':');
+  const groupId = parseInt(groupRaw, 10);
+  if (!Number.isFinite(groupId)) {
+    player.unpair = null;
+    player.unpairMain = false;
+    return;
+  }
+
+  player.unpair = groupId;
+  player.unpairMain = roleRaw === 'main';
+  if (player.unpairMain) clearDuplicateUnpairMain(groupId, player);
+}
+
+function finalizePlayerRecords(sourcePlayers = players) {
+  (sourcePlayers || []).forEach(ensurePlayerId);
+  const { byName } = buildPlayerLookups(sourcePlayers);
+  const unpairMainByGroup = new Set();
+  (sourcePlayers || []).forEach(player => {
+    if (!player) return;
+    player.rating = getPlayerRating(player);
+    player.recentTeammates = normalizeRecentHistoryRefs(player.recentTeammates, byName);
+    player.recentOpponents = normalizeRecentHistoryRefs(player.recentOpponents, byName);
+    normalizePlayerPrefer(player);
+    if (playerFlagValue(player, 'unpair') === null) {
+      player.unpairMain = false;
+      return;
+    }
+    if (!player.unpairMain) return;
+    if (unpairMainByGroup.has(player.unpair)) {
+      player.unpairMain = false;
+      return;
+    }
+    unpairMainByGroup.add(player.unpair);
+  });
+  return sourcePlayers;
+}
+
+function normalizeHistoryTeam(teamNames, teamIds, byId, byName) {
+  const names = Array.isArray(teamNames) ? teamNames.slice() : [];
+  const refsSource = Array.isArray(teamIds) && teamIds.length ? teamIds : names;
+  const refs = refsSource.map((ref, idx) => {
+    if (!ref && names[idx]) ref = names[idx];
+    if (byId.has(ref)) return ref;
+    const player = byName.get(ref);
+    return player ? ensurePlayerId(player) : ref || null;
+  });
+  const displayNames = refs.map((ref, idx) => {
+    const player = byId.get(ref);
+    return player ? player.name : (names[idx] || ref || '');
+  });
+  return { refs, names: displayNames };
+}
+
+function normalizeHistoryEntry(entry, byId, byName) {
+  if (!entry) return entry;
+  if (entry.note) return { ...entry };
+  const team1 = normalizeHistoryTeam(entry.team1, entry.team1Ids, byId, byName);
+  const team2 = normalizeHistoryTeam(entry.team2, entry.team2Ids, byId, byName);
+  return {
+    ...entry,
+    team1: team1.names,
+    team2: team2.names,
+    team1Ids: team1.refs,
+    team2Ids: team2.refs
+  };
+}
+
+function finalizeHistoryEntries(historyList = match_history, sourcePlayers = players) {
+  const { byId, byName } = buildPlayerLookups(sourcePlayers);
+  return (historyList || []).map(entry => normalizeHistoryEntry(entry, byId, byName));
+}
+
+function refreshHistoryNamesForPlayer(player) {
+  if (!player) return;
+  const playerId = ensurePlayerId(player);
+  match_history = (match_history || []).map(entry => {
+    if (!entry || entry.note) return entry;
+    const next = { ...entry };
+    ['team1', 'team2'].forEach(teamKey => {
+      const idsKey = `${teamKey}Ids`;
+      if (!Array.isArray(next[teamKey])) next[teamKey] = [];
+      if (!Array.isArray(next[idsKey])) next[idsKey] = [];
+      next[idsKey].forEach((ref, idx) => {
+        if (ref === playerId) next[teamKey][idx] = player.name;
+      });
+    });
+    return next;
+  });
+}
+
+function getHistoryTeamRefs(entry, teamKey) {
+  if (!entry) return [];
+  const idsKey = `${teamKey}Ids`;
+  return Array.isArray(entry[idsKey]) && entry[idsKey].length ? entry[idsKey] : (entry[teamKey] || []);
+}
+
+function getPlayerNameByRef(ref, fallback = '') {
+  if (!ref) return fallback;
+  const player = findPlayerByRef(ref);
+  return player ? player.name : (fallback || ref);
+}
+
 // ============== CORE UTILITIES ==============
 
 function pairKey(a, b) {
-  const n1 = (a && a.name) ? a.name : a;
-  const n2 = (b && b.name) ? b.name : b;
+  const n1 = getPlayerRef(a);
+  const n2 = getPlayerRef(b);
   return [n1, n2].sort().join('|');
 }
 
@@ -143,7 +470,8 @@ function getStateSnapshot() {
   return {
     active: (active_matches || []).map(m => m ? formatMatch(m) : null),
     queue: (queue_matches || []).map(m => m ? formatMatch(m) : null),
-    idle: (idle_players || []).map(formatPlayer)
+    idle: (idle_players || []).map(formatPlayer),
+    courts: COURT_NUMBERS.map((courtNumber, index) => ({ court: courtNumber, enabled: isCourtEnabled(index) }))
   };
 }
 
@@ -154,6 +482,153 @@ function levelDiffForMatch(match) {
 
 function hasEqualLevelTeams(match) {
   return levelDiffForMatch(match) < 2;
+}
+
+const RATING_CONFIG = {
+  baseWin: 50,
+  baseLoss: -50,
+  teamDiffPerLevel: 10,
+  teamDiffCap: 20,
+  mvpLowerThanTeammate: 20,
+  mvpLowerThanOppAvg: 30,
+  minDelta: -100,
+  maxDelta: 100,
+  minLevel: 1,
+  maxLevel: 10
+};
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function averageTeamRating(team) {
+  if (!Array.isArray(team) || !team.length) return 0;
+  return team_rating(team) / team.length;
+}
+
+function getPlayerLevelFromRating(rating) {
+  const normalizedRating = Number.isFinite(Number(rating)) ? Number(rating) : levelBaseRating(RATING_CONFIG.minLevel);
+  const computedLevel = Math.floor(normalizedRating / 100);
+  return clampNumber(computedLevel, RATING_CONFIG.minLevel, RATING_CONFIG.maxLevel);
+}
+
+function syncPlayerLevelToRating(player) {
+  if (!player) return { previousLevel: RATING_CONFIG.minLevel, nextLevel: RATING_CONFIG.minLevel, changed: false };
+  const previousLevel = Number.isFinite(Number(player.level)) ? Number(player.level) : RATING_CONFIG.minLevel;
+  player.rating = getPlayerRating(player);
+  const nextLevel = getPlayerLevelFromRating(player.rating);
+  player.level = nextLevel;
+  normalizePlayerPrefer(player);
+  return { previousLevel, nextLevel, changed: previousLevel !== nextLevel };
+}
+
+function syncAllPlayersLevelsToRating() {
+  const changes = [];
+  (players || []).forEach(player => {
+    const syncResult = syncPlayerLevelToRating(player);
+    if (syncResult.changed) {
+      changes.push({ name: player.name, previousLevel: syncResult.previousLevel, nextLevel: syncResult.nextLevel });
+    }
+  });
+  return changes;
+}
+
+function renderLevelSyncControl() {
+  const btn = document.getElementById('toggleLevelSync');
+  const status = document.getElementById('levelSyncStatus');
+  if (btn) {
+    btn.textContent = `Auto Level Sync: ${autoSyncLevelsFromRating ? 'ON' : 'OFF'}`;
+    btn.classList.toggle('level-sync-toggle-on', autoSyncLevelsFromRating);
+    btn.classList.toggle('level-sync-toggle-off', !autoSyncLevelsFromRating);
+  }
+  if (status) {
+    status.textContent = autoSyncLevelsFromRating
+      ? 'Rating updates will change level immediately after each result.'
+      : 'Rating still accumulates, but level stays frozen until you turn sync back ON.';
+  }
+}
+
+function setAutoSyncLevelsFromRating(enabled, options = {}) {
+  const { save = true, syncAll = false } = options;
+  autoSyncLevelsFromRating = !!enabled;
+
+  if (autoSyncLevelsFromRating && syncAll) {
+    const changes = syncAllPlayersLevelsToRating();
+    if (changes.length) {
+      logLine(`levelSync:syncAll ${changes.map(change => `${change.name} L${change.previousLevel}->L${change.nextLevel}`).join(', ')}`);
+    } else {
+      logLine('levelSync:syncAll no_level_changes');
+    }
+  }
+
+  renderLevelSyncControl();
+
+  if (save) saveState();
+}
+
+function buildRatingUpdateForPlayer(player, ownTeam, opposingTeam, didWin) {
+  const teammate = (ownTeam || []).find(candidate => !samePlayer(candidate, player)) || null;
+  const ownTeamAvgRating = averageTeamRating(ownTeam);
+  const opposingTeamAvgRating = averageTeamRating(opposingTeam);
+  const ownPlayerRating = getPlayerRating(player);
+  const teammateLevel = teammate?.level || 0;
+  const playerLevel = player?.level || 0;
+  const gapLevel = Math.round((opposingTeamAvgRating - ownTeamAvgRating) / 100);
+  const teamDiffRaw = clampNumber(gapLevel * RATING_CONFIG.teamDiffPerLevel, -RATING_CONFIG.teamDiffCap, RATING_CONFIG.teamDiffCap);
+  const teamDiff = didWin ? teamDiffRaw : -teamDiffRaw;
+  const base = didWin ? RATING_CONFIG.baseWin : RATING_CONFIG.baseLoss;
+
+  let mvpBonus = 0;
+  if (didWin) {
+    if ((teammateLevel - playerLevel) >= 1) mvpBonus += RATING_CONFIG.mvpLowerThanTeammate;
+    if ((opposingTeamAvgRating - ownPlayerRating) >= 100) mvpBonus += RATING_CONFIG.mvpLowerThanOppAvg;
+  }
+
+  const delta = clampNumber(base + teamDiff + mvpBonus, RATING_CONFIG.minDelta, RATING_CONFIG.maxDelta);
+  const beforeRating = ownPlayerRating;
+  const afterRating = beforeRating + delta;
+  const beforeLevel = playerLevel;
+  const afterLevel = getPlayerLevelFromRating(afterRating);
+
+  return {
+    playerId: ensurePlayerId(player),
+    name: player?.name || '',
+    won: didWin,
+    base,
+    teamDiff,
+    mvpBonus,
+    delta,
+    beforeRating,
+    afterRating,
+    beforeLevel,
+    afterLevel,
+    ownTeamAvgRating,
+    opposingTeamAvgRating
+  };
+}
+
+function applyRatingUpdatesForMatch(winners, losers) {
+  const updates = [];
+  (winners || []).forEach(player => {
+    updates.push(buildRatingUpdateForPlayer(player, winners, losers, true));
+  });
+  (losers || []).forEach(player => {
+    updates.push(buildRatingUpdateForPlayer(player, losers, winners, false));
+  });
+
+  updates.forEach(update => {
+    const player = findPlayerByRef(update.playerId) || players.find(candidate => samePlayer(candidate, update.playerId));
+    if (!player) return;
+    player.rating = update.afterRating;
+    if (autoSyncLevelsFromRating) {
+      const syncResult = syncPlayerLevelToRating(player);
+      update.afterLevel = syncResult.nextLevel;
+    } else {
+      update.afterLevel = player.level || update.beforeLevel;
+    }
+  });
+
+  return updates;
 }
 
 function idleIndexOf(player) {
@@ -176,15 +651,27 @@ function sortIdlePlayersByIndex() {
 }
 
 function applyIdleIndexOnAssignment(selectedPlayers) {
-  const selectedNames = new Set((selectedPlayers || []).filter(p => p && p.name).map(p => p.name));
-  if (!selectedNames.size) return;
+  const selectedRefs = new Set((selectedPlayers || []).map(getPlayerRef).filter(Boolean));
+  if (!selectedRefs.size) return;
   (idle_players || []).forEach(p => {
     ensureIdleIndex(p);
-    if (selectedNames.has(p.name)) p.idleIndex = 0;
+    if (selectedRefs.has(getPlayerRef(p))) p.idleIndex = 0;
     else p.idleIndex += 1;
   });
   sortIdlePlayersByIndex();
-  logLine(`idleIndex:update selected=${JSON.stringify(Array.from(selectedNames))} idleOrder=${JSON.stringify(idle_players.map(p => ({ name: p.name, idleIndex: p.idleIndex })))}`);
+  logLine(`idleIndex:update selected=${JSON.stringify(Array.from(selectedRefs))} idleOrder=${JSON.stringify(idle_players.map(p => ({ name: p.name, idleIndex: p.idleIndex })))}`);
+}
+
+function getTopIdleSeedIndex(excludedPlayers = []) {
+  const excludedRefs = new Set((excludedPlayers || []).map(getPlayerRef).filter(Boolean));
+  let maxIdleIndex = 0;
+
+  (idle_players || []).forEach(player => {
+    if (!player || excludedRefs.has(getPlayerRef(player))) return;
+    maxIdleIndex = Math.max(maxIdleIndex, idleIndexOf(player));
+  });
+
+  return maxIdleIndex + 1;
 }
 
 function isMatchLocation(loc) {
@@ -272,8 +759,8 @@ function getPreviousMatchViolation(match, policyKey = 'strict2') {
     for (const [p1, p2] of teammatePairs) {
       if (playersShareFlag(p1, p2, 'couple')) continue;
       if (
-        getRecentNamesWithinDepth(p1, 'recentTeammates', policy.teammateDepth).includes(p2.name) ||
-        getRecentNamesWithinDepth(p2, 'recentTeammates', policy.teammateDepth).includes(p1.name)
+        getRecentNamesWithinDepth(p1, 'recentTeammates', policy.teammateDepth).includes(getPlayerRef(p2)) ||
+        getRecentNamesWithinDepth(p2, 'recentTeammates', policy.teammateDepth).includes(getPlayerRef(p1))
       ) {
         return `recent_teammate:${pairKey(p1, p2)}`;
       }
@@ -284,8 +771,8 @@ function getPreviousMatchViolation(match, policyKey = 'strict2') {
     const opponentPairs = [[a, c], [a, d], [b, c], [b, d]];
     for (const [p1, p2] of opponentPairs) {
       if (
-        getRecentNamesWithinDepth(p1, 'recentOpponents', policy.opponentDepth).includes(p2.name) ||
-        getRecentNamesWithinDepth(p2, 'recentOpponents', policy.opponentDepth).includes(p1.name)
+        getRecentNamesWithinDepth(p1, 'recentOpponents', policy.opponentDepth).includes(getPlayerRef(p2)) ||
+        getRecentNamesWithinDepth(p2, 'recentOpponents', policy.opponentDepth).includes(getPlayerRef(p1))
       ) {
         return `recent_opponent:${pairKey(p1, p2)}`;
       }
@@ -299,20 +786,20 @@ function markPlayersLastPlayed(match) {
   if (!match) return;
   const [team1, team2] = match;
   if (team1?.[0]) {
-    pushRecentRound(team1[0], 'recentTeammates', team1[1] ? [team1[1].name] : []);
-    pushRecentRound(team1[0], 'recentOpponents', team2.filter(Boolean).map(player => player.name));
+    pushRecentRound(team1[0], 'recentTeammates', team1[1] ? [getPlayerRef(team1[1])] : []);
+    pushRecentRound(team1[0], 'recentOpponents', team2.filter(Boolean).map(getPlayerRef));
   }
   if (team1?.[1]) {
-    pushRecentRound(team1[1], 'recentTeammates', team1[0] ? [team1[0].name] : []);
-    pushRecentRound(team1[1], 'recentOpponents', team2.filter(Boolean).map(player => player.name));
+    pushRecentRound(team1[1], 'recentTeammates', team1[0] ? [getPlayerRef(team1[0])] : []);
+    pushRecentRound(team1[1], 'recentOpponents', team2.filter(Boolean).map(getPlayerRef));
   }
   if (team2?.[0]) {
-    pushRecentRound(team2[0], 'recentTeammates', team2[1] ? [team2[1].name] : []);
-    pushRecentRound(team2[0], 'recentOpponents', team1.filter(Boolean).map(player => player.name));
+    pushRecentRound(team2[0], 'recentTeammates', team2[1] ? [getPlayerRef(team2[1])] : []);
+    pushRecentRound(team2[0], 'recentOpponents', team1.filter(Boolean).map(getPlayerRef));
   }
   if (team2?.[1]) {
-    pushRecentRound(team2[1], 'recentTeammates', team2[0] ? [team2[0].name] : []);
-    pushRecentRound(team2[1], 'recentOpponents', team1.filter(Boolean).map(player => player.name));
+    pushRecentRound(team2[1], 'recentTeammates', team2[0] ? [getPlayerRef(team2[0])] : []);
+    pushRecentRound(team2[1], 'recentOpponents', team1.filter(Boolean).map(getPlayerRef));
   }
 }
 
@@ -331,10 +818,10 @@ function clearSatisfiedPartnerFlags(match) {
 }
 
 function getAvailablePartnerSlot(excludedPlayers = []) {
-  const excludedNames = new Set((excludedPlayers || []).filter(Boolean).map(player => player.name));
+  const excludedRefs = new Set((excludedPlayers || []).filter(Boolean).map(getPlayerRef));
   const usedSlots = new Set(
     (players || [])
-      .filter(player => player && player.partnerSlot && !excludedNames.has(player.name))
+      .filter(player => player && player.partnerSlot && !excludedRefs.has(getPlayerRef(player)))
       .map(player => player.partnerSlot)
   );
 
@@ -351,7 +838,7 @@ function getAvailablePartnerSlot(excludedPlayers = []) {
 function assignWishPartner(playerIndex, partnerIndex) {
   const player = players[playerIndex];
   const partner = players[partnerIndex];
-  if (!player || !partner || player.name === partner.name) return false;
+  if (!player || !partner || samePlayer(player, partner)) return false;
 
   const slot = playersShareFlag(player, partner, 'partnerSlot')
     ? player.partnerSlot
@@ -374,11 +861,62 @@ function playersShareFlag(a, b, key) {
   return aValue !== null && bValue !== null && aValue === bValue;
 }
 
+function isUnpairMain(player) {
+  return !!player && playerFlagValue(player, 'unpair') !== null && !!player.unpairMain;
+}
+
+function playersConflictOnUnpair(a, b) {
+  if (!playersShareFlag(a, b, 'unpair')) return false;
+  return isUnpairMain(a) || isUnpairMain(b);
+}
+
+function clearDuplicateUnpairMain(groupId, keeper) {
+  if (groupId === null || groupId === undefined || groupId === '') return;
+  (players || []).forEach(player => {
+    if (!player || player === keeper) return;
+    if (playerFlagValue(player, 'unpair') !== groupId) return;
+    player.unpairMain = false;
+  });
+}
+
+function formatUnpairLabel(player) {
+  const groupId = playerFlagValue(player, 'unpair');
+  if (groupId === null) return 'Normal';
+  return `No${groupId}.${player.unpairMain ? 'Main' : 'Member'}`;
+}
+
+function advanceUnpairState(player) {
+  if (!player) return;
+
+  const currentGroup = playerFlagValue(player, 'unpair');
+  if (currentGroup === null) {
+    player.unpair = 1;
+    clearDuplicateUnpairMain(1, player);
+    player.unpairMain = true;
+    return;
+  }
+
+  if (player.unpairMain) {
+    player.unpairMain = false;
+    return;
+  }
+
+  if (currentGroup < MAX_COUPLE) {
+    player.unpair = currentGroup + 1;
+    clearDuplicateUnpairMain(player.unpair, player);
+    player.unpairMain = true;
+    return;
+  }
+
+  player.unpair = null;
+  player.unpairMain = false;
+}
+
 function getPlayerTeamIndex(match, player) {
   if (!match || !player) return -1;
-  const playerName = typeof player === 'string' ? player : player.name;
+  const playerRef = getPlayerRef(player);
   for (let teamIdx = 0; teamIdx < 2; teamIdx++) {
-    if ((match[teamIdx] || []).some(p => p && p.name === playerName)) return teamIdx;
+    if ((match[teamIdx] || []).some(p => p && getPlayerRef(p) === playerRef)) return teamIdx;
   }
   return -1;
 }
@@ -391,17 +929,17 @@ function areTeammates(match, a, b) {
 
 function getPlayerPlacementInState(state, player) {
   if (!state || !player) return null;
-  const playerName = typeof player === 'string' ? player : player.name;
+  const playerRef = getPlayerRef(player);
 
   for (let idx = 0; idx < (state.active || []).length; idx++) {
     const match = state.active[idx];
-    const teamIndex = getPlayerTeamIndex(match, playerName);
+    const teamIndex = getPlayerTeamIndex(match, playerRef);
     if (teamIndex !== -1) return { bucket: 'active', index: idx, teamIndex };
   }
 
   for (let idx = 0; idx < (state.queue || []).length; idx++) {
     const match = state.queue[idx];
-    const teamIndex = getPlayerTeamIndex(match, playerName);
+    const teamIndex = getPlayerTeamIndex(match, playerRef);
     if (teamIndex !== -1) return { bucket: 'queue', index: idx, teamIndex };
   }
 
@@ -417,7 +955,7 @@ function validateHardRulesForMatch(match) {
       if (playersShareFlag(flat[i], flat[j], 'couple') && !areTeammates(match, flat[i], flat[j])) {
         return { valid: false, reason: `couple_split:${pairKey(flat[i], flat[j])}` };
       }
-      if (playersShareFlag(flat[i], flat[j], 'unpair') && areTeammates(match, flat[i], flat[j])) {
+      if (playersConflictOnUnpair(flat[i], flat[j]) && areTeammates(match, flat[i], flat[j])) {
         return { valid: false, reason: `unpair_teammate:${pairKey(flat[i], flat[j])}` };
       }
     }
@@ -530,13 +1068,13 @@ function computeMatchTypeBalancePenalty(state) {
 }
 
 function groupRespectsAvailableCouples(group, candidatePlayers) {
-  const groupNames = new Set((group || []).filter(Boolean).map(player => player.name));
+  const groupRefs = new Set((group || []).filter(Boolean).map(getPlayerRef));
 
   for (const player of (group || [])) {
     const coupleId = playerFlagValue(player, 'couple');
     if (coupleId === null) continue;
-    const availablePartners = (candidatePlayers || []).filter(other => other && other.name !== player.name && playersShareFlag(player, other, 'couple'));
-    if (availablePartners.some(other => !groupNames.has(other.name))) return false;
+    const availablePartners = (candidatePlayers || []).filter(other => other && !samePlayer(other, player) && playersShareFlag(player, other, 'couple'));
+    if (availablePartners.some(other => !groupRefs.has(getPlayerRef(other)))) return false;
   }
 
   return true;
@@ -547,7 +1085,7 @@ function countFemales(group) {
 }
 
 function countEmptyCourts() {
-  return (active_matches || []).filter(match => !match).length;
+  return (active_matches || []).filter((match, index) => isCourtEnabled(index) && !match).length;
 }
 
 function scoreCandidateForSeed(seed, candidate) {
@@ -558,15 +1096,15 @@ function scoreCandidateForSeed(seed, candidate) {
 
   if (playersShareFlag(seed, candidate, 'couple')) score += 220;
   if (playersShareFlag(seed, candidate, 'partnerSlot')) score += 120;
-  if (playersShareFlag(seed, candidate, 'unpair')) score -= 30;
+  if (playersConflictOnUnpair(seed, candidate)) score -= 30;
 
   const candidateRecentTeam = getRecentNames(candidate, 'recentTeammates');
   const candidateRecentOpp = getRecentNames(candidate, 'recentOpponents');
   const seedRecentTeam = getRecentNames(seed, 'recentTeammates');
   const seedRecentOpp = getRecentNames(seed, 'recentOpponents');
 
-  if (!playersShareFlag(seed, candidate, 'couple') && (seedRecentTeam.includes(candidate.name) || candidateRecentTeam.includes(seed.name))) score -= 25;
-  if (seedRecentOpp.includes(candidate.name) || candidateRecentOpp.includes(seed.name)) score -= 15;
+  if (!playersShareFlag(seed, candidate, 'couple') && (seedRecentTeam.includes(getPlayerRef(candidate)) || candidateRecentTeam.includes(getPlayerRef(seed)))) score -= 25;
+  if (seedRecentOpp.includes(getPlayerRef(candidate)) || candidateRecentOpp.includes(getPlayerRef(seed))) score -= 15;
 
   return score;
 }
@@ -716,7 +1254,7 @@ function getChallengeReservePlan(rankedPlayers, policyKey, poolLimit) {
       challenge: candidate.player,
       rankIndex: candidate.rankIndex,
       result,
-      reserveNames: new Set(result.match.flat().filter(Boolean).map(player => player.name))
+      reserveNames: new Set(result.match.flat().filter(Boolean).map(getPlayerRef))
     };
   }
 
@@ -731,8 +1269,8 @@ function buildHistoricalMaps() {
   
   for (const h of match_history || []) {
     if (!h || !h.team1 || !h.team2) continue;
-    const [t1a, t1b] = h.team1;
-    const [t2a, t2b] = h.team2;
+    const [t1a, t1b] = getHistoryTeamRefs(h, 'team1');
+    const [t2a, t2b] = getHistoryTeamRefs(h, 'team2');
     
     // Track teammates
     const tk1 = pairKey(t1a, t1b);
@@ -757,6 +1295,8 @@ function toHistoryLikeMatch(match) {
   if (!match || !match[0] || !match[1]) return null;
   if (!match[0][0] || !match[0][1] || !match[1][0] || !match[1][1]) return null;
   return {
+    team1Ids: [getPlayerRef(match[0][0]), getPlayerRef(match[0][1])],
+    team2Ids: [getPlayerRef(match[1][0]), getPlayerRef(match[1][1])],
     team1: [match[0][0].name, match[0][1].name],
     team2: [match[1][0].name, match[1][1].name]
   };
@@ -1196,13 +1736,17 @@ function renderCourt(i) {
     courtsRow.appendChild(wrapper);
   }
   const card = courtsRow.children[i];
+  const courtLabel = getCourtLabel(i);
+  const courtEnabled = isCourtEnabled(i);
+  const toggleButtonHtml = `<button class="court-switch ${courtEnabled ? 'court-switch-on' : 'court-switch-off'}" type="button" role="switch" aria-checked="${courtEnabled}" aria-label="${courtEnabled ? 'Turn off' : 'Turn on'} ${courtLabel}" data-toggle-court="${i}"><span class="court-switch-track"><span class="court-switch-thumb"></span></span></button>`;
   let html = '';
   
   if (active_matches[i] && isCompleteMatch(active_matches[i])) {
     const [t1, t2] = active_matches[i];
     html = `<div class="card">
-      <div class="card-header position-relative">
-        <div class="w-100 text-center fs-5 fw-bold">Sân ${10 + i}</div>
+      <div class="card-header position-relative d-flex justify-content-between align-items-center">
+        <div class="fs-5 fw-bold">${courtLabel}</div>
+        ${toggleButtonHtml}
       </div>
       <div class="card-body d-flex align-items-center">
         <div class="team-col text-center flex-fill">
@@ -1230,8 +1774,11 @@ function renderCourt(i) {
     const [t1, t2] = active_matches[i];
     html = `<div class="card manual-match-card">
       <div class="card-header position-relative d-flex justify-content-between align-items-center">
-        <div class="fs-5 fw-bold">Sân ${10 + i}</div>
-        <button class="btn btn-sm uniform-btn" data-clear-manual="${i}">Clear Manual</button>
+        <div class="fs-5 fw-bold">${courtLabel}</div>
+        <div class="d-flex align-items-center gap-2">
+          ${toggleButtonHtml}
+          <button class="btn btn-sm uniform-btn" data-clear-manual="${i}">Clear Manual</button>
+        </div>
       </div>
       <div class="card-body d-flex align-items-center">
         <div class="team-col text-center flex-fill">
@@ -1256,13 +1803,16 @@ function renderCourt(i) {
     </div>`;
   } else {
     html = `<div class="card">
-      <div class="card-header position-relative">
-        <div class="w-100 text-center fs-5 fw-bold">Sân ${10 + i}</div>
+      <div class="card-header position-relative d-flex justify-content-between align-items-center">
+        <div class="fs-5 fw-bold">${courtLabel}</div>
+        ${toggleButtonHtml}
       </div>
       <div class="card-body">
-        <div class="empty-slot" data-loc="court:${i}:empty" ondragover="onPlayerDragOver(event)" ondrop="onPlayerDrop(event)">
+        ${courtEnabled
+          ? `<div class="empty-slot" data-loc="court:${i}:empty" ondragover="onPlayerDragOver(event)" ondrop="onPlayerDrop(event)">
           <button class="btn btn-sm uniform-btn" data-manual-court="${i}">Manual Match</button>
-        </div>
+        </div>`
+          : `<div class="empty-slot empty-slot-off">Court OFF</div>`}
       </div>
     </div>`;
   }
@@ -1281,6 +1831,17 @@ function renderCourt(i) {
   
   const btn = card.querySelector('button[data-court]');
   if (btn) btn.onclick = () => openScoreModal(i);
+  const toggleBtn = card.querySelector('button[data-toggle-court]');
+  if (toggleBtn) {
+    toggleBtn.onclick = () => {
+      setCourtEnabledState(i, !isCourtEnabled(i));
+      updateIdlePlayers();
+      promoteQueueMatchesToEnabledCourts('courtToggle:promoteQueue');
+      saveState();
+      render();
+      renderAdminPlayers();
+    };
+  }
   const manualBtn = card.querySelector('button[data-manual-court]');
   if (manualBtn) {
     manualBtn.onclick = () => {
@@ -1297,7 +1858,7 @@ function renderCourt(i) {
       const match = active_matches[i];
       if (match) {
         match.flat().filter(Boolean).forEach(player => {
-          if (!idle_players.some(idle => idle.name === player.name)) idle_players.push(player);
+          if (!idle_players.some(idle => samePlayer(idle, player))) idle_players.push(player);
         });
       }
       active_matches[i] = null;
@@ -1362,6 +1923,14 @@ function renderIdle() {
   idleBox.appendChild(ul);
 }
 
+function formatHistoryRatingUpdates(entry) {
+  const updates = Array.isArray(entry?.ratingUpdates) ? entry.ratingUpdates : [];
+  if (!updates.length) return '';
+  return updates
+    .map(update => `${update.name} ${formatSignedRating(update.delta)}${update.beforeLevel !== update.afterLevel ? ` (L${update.beforeLevel}->L${update.afterLevel})` : ''}${update.mvpBonus ? ' MVP' : ''}`)
+    .join(', ');
+}
+
 function renderHistory() {
   const hb = document.getElementById('adminHistoryBox');
   if (!hb) return;
@@ -1376,7 +1945,8 @@ function renderHistory() {
       const t2 = m.team2.join(' - ');
       const scoreStr = m.score ? `${m.score[0]}-${m.score[1]}` : '';
       const winStr = m.winnerTeam ? (m.winnerTeam === 1 ? '(T1 win)' : '(T2 win)') : '';
-      d.textContent = `${t1} ${scoreStr} vs ${t2} ${winStr}`;
+      const ratingSummary = formatHistoryRatingUpdates(m);
+      d.textContent = `${t1} ${scoreStr} vs ${t2} ${winStr}${ratingSummary ? `\nR: ${ratingSummary}` : ''}`;
     }
     hb.appendChild(d);
   });
@@ -1636,6 +2206,14 @@ function performSwap(srcLoc, dstLoc) {
   if (srcLoc.startsWith('idle:') && isMatchLocation(dstLoc) && srcPlayer) selectedFromIdle.push(srcPlayer);
   if (dstLoc.startsWith('idle:') && isMatchLocation(srcLoc) && dstPlayer) selectedFromIdle.push(dstPlayer);
   if (selectedFromIdle.length) applyIdleIndexOnAssignment(selectedFromIdle);
+
+  let returningToIdlePlayer = null;
+  if (isMatchLocation(srcLoc) && dstLoc.startsWith('idle:') && srcPlayer) returningToIdlePlayer = srcPlayer;
+  if (isMatchLocation(dstLoc) && srcLoc.startsWith('idle:') && dstPlayer) returningToIdlePlayer = dstPlayer;
+  if (returningToIdlePlayer) {
+    returningToIdlePlayer.idleIndex = getTopIdleSeedIndex(selectedFromIdle);
+    logLine(`idleIndex:returnToIdle priority name=${returningToIdlePlayer.name} idleIndex=${returningToIdlePlayer.idleIndex}`);
+  }
   
   removePlayerFromLocation(srcLoc);
   removePlayerFromLocation(dstLoc);
@@ -1693,13 +2271,20 @@ function applyResult(courtIdx, scoreStr) {
   
   // Update player stats
   [...t1, ...t2].forEach(p => { p.matches++; });
+  const ratingUpdates = applyRatingUpdatesForMatch(winners, losers);
+  ratingUpdates.forEach(update => {
+    logLine(`rating:update player=${update.name} won=${update.won} before=${update.beforeRating} delta=${formatSignedRating(update.delta)} after=${update.afterRating} base=${update.base} teamDiff=${formatSignedRating(update.teamDiff)} mvp=${formatSignedRating(update.mvpBonus)} level=${update.beforeLevel}->${update.afterLevel}`);
+  });
   
   // Record history
   const hist = {
     ts: new Date().toISOString(),
+    team1Ids: [getPlayerRef(t1[0]), getPlayerRef(t1[1])],
+    team2Ids: [getPlayerRef(t2[0]), getPlayerRef(t2[1])],
     team1: [t1[0].name, t1[1].name],
     team2: [t2[0].name, t2[1].name],
-    winnerTeam: winners === t1 ? 1 : 2
+    winnerTeam: winners === t1 ? 1 : 2,
+    ratingUpdates
   };
   match_history.push(hist);
   markPlayersLastPlayed(match);
@@ -1711,7 +2296,7 @@ function applyResult(courtIdx, scoreStr) {
   const freePlayers = [...t1, ...t2];
   logLine(`applyResult:freePlayers court=${courtIdx} players=${freePlayers.map(formatPlayer).join(', ')}`);
   freePlayers.forEach(p => {
-    const existing = idle_players.find(x => x.name === p.name);
+    const existing = idle_players.find(x => samePlayer(x, p));
     if (existing) {
       existing.idleIndex = 0;
     } else {
@@ -1721,12 +2306,12 @@ function applyResult(courtIdx, scoreStr) {
   });
   
   // Move next queue match to court
-  if (queue_matches.length > 0) {
+  if (isCourtEnabled(courtIdx) && queue_matches.length > 0) {
     active_matches[courtIdx] = queue_matches.shift();
     logLine(`applyResult:promoteQueue court=${courtIdx} promoted=${formatMatch(active_matches[courtIdx])}`);
   } else {
     active_matches[courtIdx] = null;
-    logLine(`applyResult:clearCourt court=${courtIdx} reason=no_queue_match`);
+    logLine(`applyResult:clearCourt court=${courtIdx} reason=${isCourtEnabled(courtIdx) ? 'no_queue_match' : 'court_disabled'}`);
   }
   
   // Keep creating matches from idle while possible, to fill all empty courts first
@@ -1745,12 +2330,12 @@ function applyResult(courtIdx, scoreStr) {
 
     // Remove selected players from idle
     newMatch.flat().forEach(p => {
-      const idx = idle_players.findIndex(x => x.name === p.name);
+      const idx = idle_players.findIndex(x => samePlayer(x, p));
       if (idx !== -1) idle_players.splice(idx, 1);
     });
 
     // Add to queue or fill empty court
-    const emptyCourtIdx = active_matches.findIndex(m => !m);
+    const emptyCourtIdx = getFirstAvailableEnabledCourtIndex();
     if (emptyCourtIdx !== -1) {
       active_matches[emptyCourtIdx] = newMatch;
       logLine(`applyResult:assignCourt court=${emptyCourtIdx} match=${formatMatch(newMatch)}`);
@@ -1794,7 +2379,7 @@ function createNewMatch() {
       }
 
       const candidatePool = reservePlan
-        ? ranked.filter(player => !reservePlan.reserveNames.has(player.name))
+        ? ranked.filter(player => !reservePlan.reserveNames.has(getPlayerRef(player)))
         : ranked;
       const seedCandidates = candidatePool.slice(0, Math.min(MAX_SEED_ATTEMPTS, candidatePool.length));
 
@@ -1831,18 +2416,142 @@ function createNewMatch() {
   return null;
 }
 
+function getMatchPolicySequence() {
+  const emptyCourts = countEmptyCourts();
+  return emptyCourts >= 2
+    ? ['strict2', 'strict1', 'skipRule3', 'skipRule2And3']
+    : ['strict2'];
+}
+
+function rankIdleCandidates(candidates) {
+  return (candidates || []).slice().sort((a, b) => {
+    const diff = idleIndexOf(b) - idleIndexOf(a);
+    if (diff !== 0) return diff;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+}
+
+function buildCurrentStateSnapshot() {
+  return {
+    active: (active_matches || []).map(cloneMatch),
+    queue: (queue_matches || []).map(cloneMatch),
+    idle: (idle_players || []).slice()
+  };
+}
+
+function findIdleReplacementForQueueMatch(queueIndex, removedPlayer) {
+  const queueMatch = queue_matches?.[queueIndex];
+  if (!queueMatch) return null;
+
+  const remainingPlayers = queueMatch.flat().filter(player => player && !samePlayer(player, removedPlayer));
+  if (remainingPlayers.length !== 3) return null;
+
+  const rankedIdle = rankIdleCandidates(
+    (idle_players || []).filter(candidate =>
+      candidate &&
+      candidate.ready &&
+      !remainingPlayers.some(player => samePlayer(player, candidate))
+    )
+  );
+  if (!rankedIdle.length) return null;
+
+  const policySequence = getMatchPolicySequence();
+  const maps = buildHistoricalMaps();
+  let bestReplacement = null;
+
+  for (const policyKey of policySequence) {
+    for (const candidate of rankedIdle) {
+      const group = [...remainingPlayers, candidate];
+      const match = findBestMatch(group, '', policyKey);
+      if (!match) continue;
+
+      const analysis = analyzeMatch(match, maps, policyKey);
+      if (!analysis.valid) continue;
+
+      const state = buildCurrentStateSnapshot();
+      state.queue[queueIndex] = cloneMatch(match);
+      state.idle = state.idle.filter(player => !samePlayer(player, candidate));
+      const stateCost = evaluateState(state);
+      if (!Number.isFinite(stateCost)) continue;
+
+      const replacement = { candidate, match, policyKey, analysis, stateCost };
+      if (!bestReplacement) {
+        bestReplacement = replacement;
+        continue;
+      }
+
+      const idleDiff = idleIndexOf(candidate) - idleIndexOf(bestReplacement.candidate);
+      if (idleDiff > 0) {
+        bestReplacement = replacement;
+        continue;
+      }
+      if (idleDiff < 0) continue;
+
+      if (stateCost < bestReplacement.stateCost) {
+        bestReplacement = replacement;
+        continue;
+      }
+      if (stateCost > bestReplacement.stateCost) continue;
+
+      const levelDiff = Number.isFinite(analysis.levelDiff) ? analysis.levelDiff : Infinity;
+      const bestLevelDiff = Number.isFinite(bestReplacement.analysis.levelDiff) ? bestReplacement.analysis.levelDiff : Infinity;
+      if (levelDiff < bestLevelDiff) {
+        bestReplacement = replacement;
+        continue;
+      }
+      if (levelDiff > bestLevelDiff) continue;
+
+      const score = Number.isFinite(analysis.score) ? analysis.score : Infinity;
+      const bestScore = Number.isFinite(bestReplacement.analysis.score) ? bestReplacement.analysis.score : Infinity;
+      if (score < bestScore) {
+        bestReplacement = replacement;
+      }
+    }
+
+    if (bestReplacement) return bestReplacement;
+  }
+
+  return null;
+}
+
+function handleQueuedPlayerMarkedNotReady(player) {
+  if (!player) return false;
+
+  const placement = getPlayerPlacementInState({ active: active_matches, queue: queue_matches }, player);
+  if (!placement || placement.bucket !== 'queue') return false;
+
+  updateIdlePlayers();
+
+  const queueMatch = queue_matches[placement.index];
+  if (!queueMatch) return false;
+
+  const replacement = findIdleReplacementForQueueMatch(placement.index, player);
+  if (replacement?.match) {
+    applyIdleIndexOnAssignment([replacement.candidate]);
+    queue_matches[placement.index] = replacement.match;
+    logLine(`toggleReady:queueReplace removed=${formatPlayer(player)} replacement=${formatPlayer(replacement.candidate)} queueIndex=${placement.index} policy=${replacement.policyKey} match=${formatMatch(replacement.match)}`);
+  } else {
+    queue_matches.splice(placement.index, 1);
+    logLine(`toggleReady:queueRemove removed=${formatPlayer(player)} queueIndex=${placement.index} reason=no_idle_replacement match=${formatMatch(queueMatch)}`);
+  }
+
+  rebalanceExistingMatches();
+  fillMatchesFromIdle('toggleReady:notReadyQueue');
+  return true;
+}
+
 function serializeMatchByName(match) {
   if (!match || !match[0] || !match[1]) return null;
-  return match.map(team => team.map(player => player?.name || null));
+  return match.map(team => team.map(player => getPlayerRef(player)));
 }
 
 function deserializeMatchByName(snapshot, byName) {
   if (!Array.isArray(snapshot) || snapshot.length !== 2) return null;
   const restored = snapshot.map(team => {
     if (!Array.isArray(team) || team.length !== 2) return null;
-    return team.map(name => {
-      if (!name) return null;
-      const player = byName.get(name);
+    return team.map(ref => {
+      if (!ref) return null;
+      const player = byName.get(ref.id || ref) || byName.get(ref) || findPlayerByRef(ref);
       return player && player.ready ? player : null;
     });
   });
@@ -1872,7 +2581,12 @@ function loadLayoutState() {
 
 function restoreLatestArrangement() {
   const snapshot = loadLayoutState();
-  const byName = new Map((players || []).map(player => [player.name, player]));
+  const byName = new Map();
+  const { byId } = buildPlayerLookups(players);
+  (players || []).forEach(player => {
+    byName.set(player.name, player);
+    byName.set(player.id, player);
+  });
 
   active_matches = [];
   queue_matches = [];
@@ -1890,11 +2604,15 @@ function restoreLatestArrangement() {
   }
 
   while (active_matches.length < COURTS) active_matches.push(null);
+  relocateDisabledCourtMatches('restoreLatest');
+  promoteQueueMatchesToEnabledCourts('restoreLatest:promoteQueue');
   updateIdlePlayers();
 }
 
 function fillMatchesFromIdle(logPrefix) {
   let buildCount = 0;
+
+  promoteQueueMatchesToEnabledCourts(`${logPrefix || 'fillMatches'}:promoteQueue`);
 
   while (idle_players.length >= 4) {
     const newMatch = createNewMatch();
@@ -1904,11 +2622,11 @@ function fillMatchesFromIdle(logPrefix) {
     applyIdleIndexOnAssignment(newMatch.flat());
 
     newMatch.flat().forEach(p => {
-      const idx = idle_players.findIndex(x => x.name === p.name);
+      const idx = idle_players.findIndex(x => samePlayer(x, p));
       if (idx !== -1) idle_players.splice(idx, 1);
     });
 
-    const emptyCourtIdx = active_matches.findIndex(m => !m);
+    const emptyCourtIdx = getFirstAvailableEnabledCourtIndex();
     if (emptyCourtIdx !== -1) active_matches[emptyCourtIdx] = newMatch;
     else queue_matches.push(newMatch);
   }
@@ -1930,6 +2648,7 @@ function initialize() {
   active_matches = [];
   queue_matches = [];
   while (active_matches.length < COURTS) active_matches.push(null);
+  ensureCourtEnabledStates();
 
   (players || []).forEach(player => {
     if (player?.ready) player.idleIndex = 0;
@@ -1941,18 +2660,21 @@ function initialize() {
 
 function updateIdlePlayers() {
   const assigned = new Set();
-  active_matches.forEach(m => { if (m) m.flat().forEach(p => { if (p) assigned.add(p.name); }); });
-  queue_matches.forEach(m => { if (m) m.flat().forEach(p => { if (p) assigned.add(p.name); }); });
-  idle_players = players.filter(p => p.ready && !assigned.has(p.name));
+  active_matches.forEach(m => { if (m) m.flat().forEach(p => { if (p) assigned.add(getPlayerRef(p)); }); });
+  queue_matches.forEach(m => { if (m) m.flat().forEach(p => { if (p) assigned.add(getPlayerRef(p)); }); });
+  idle_players = players.filter(p => p.ready && !assigned.has(getPlayerRef(p)));
   idle_players.forEach(ensureIdleIndex);
   sortIdlePlayersByIndex();
   logLine(`idle:update assigned=${JSON.stringify(Array.from(assigned))} idle=${JSON.stringify(idle_players.map(p => ({ name: p.name, level: p.level, idleIndex: p.idleIndex })))}`);
 }
 
 function saveState() {
+  finalizePlayerRecords(players);
+  match_history = finalizeHistoryEntries(match_history, players);
   players.forEach(normalizePlayerPrefer);
   localStorage.setItem('badminton_players', JSON.stringify(players));
   localStorage.setItem('badminton_history', JSON.stringify(match_history));
+  localStorage.setItem('badminton_settings', JSON.stringify({ autoSyncLevelsFromRating, courtEnabledStates }));
   saveLayoutState();
 }
 
@@ -1961,22 +2683,8 @@ function loadState() {
   if (p) {
     try {
       const parsed = JSON.parse(p);
-      players = parsed.map(p0 => ({
-        name: p0.name,
-        level: p0.level || 4,
-        gender: p0.gender || 'male',
-        prefer: p0.prefer || 'normal',
-        rating: p0.rating !== undefined ? p0.rating : ((p0.level || 4) * 100),
-        matches: p0.matches || 0,
-        ready: p0.ready === undefined ? true : p0.ready,
-        idleIndex: Number.isFinite(Number(p0.idleIndex)) ? Math.max(0, Math.floor(Number(p0.idleIndex))) : 0,
-        couple: p0.couple === undefined ? null : p0.couple,
-        unpair: p0.unpair === undefined ? (p0.uncouple === undefined ? null : p0.uncouple) : p0.unpair,
-        partnerSlot: p0.partnerSlot === undefined ? null : p0.partnerSlot,
-        recentTeammates: normalizeRecentHistory(p0.recentTeammates),
-        recentOpponents: normalizeRecentHistory(p0.recentOpponents)
-      }));
-      players.forEach(normalizePlayerPrefer);
+      players = parsed.map(normalizePlayerRecord);
+      finalizePlayerRecords(players);
     } catch (e) { console.error('failed to parse players', e); }
   }
 
@@ -1985,6 +2693,17 @@ function loadState() {
     try { match_history = JSON.parse(h); }
     catch (e) { console.error('failed to parse history', e); }
   }
+
+  const settings = localStorage.getItem('badminton_settings');
+  if (settings) {
+    try {
+      const parsed = JSON.parse(settings);
+      autoSyncLevelsFromRating = parsed.autoSyncLevelsFromRating !== undefined ? !!parsed.autoSyncLevelsFromRating : true;
+      courtEnabledStates = Array.isArray(parsed.courtEnabledStates) ? parsed.courtEnabledStates : courtEnabledStates;
+      ensureCourtEnabledStates();
+    } catch (e) { console.error('failed to parse settings', e); }
+  }
+  match_history = finalizeHistoryEntries(match_history, players);
   // load debug log too
   loadLog();
 }
@@ -2009,26 +2728,29 @@ function renderAdminPlayers() {
     const pref = getEffectivePrefer(p);
     const prefClass = pref === 'chill' ? 'prefer-chill' : (pref === 'challenge' ? 'prefer-challenge' : 'prefer-normal');
     const prefLabel = pref.charAt(0).toUpperCase() + pref.slice(1);
-    const partnerLabel = p.partnerSlot || 'No Partner';
-    const coupleLabel = p.couple ? ('C' + p.couple) : 'Single';
-    const coupleClass = p.couple ? 'btn-info text-white' : 'btn-single';
-    const unpairLabel = p.unpair ? ('No' + p.unpair) : 'Normal';
+    const accumulatedRating = getPlayerAccumulatedRating(p);
+    const levelTitle = `Rating ${Math.round(getPlayerRating(p))} (${formatSignedRating(accumulatedRating)} from L${p.level} base)`;
+    const ratingSummary = `R${Math.round(getPlayerRating(p))} | ${formatSignedRating(accumulatedRating)}`;
+    const partnerSelectHtml = buildSelectOptions(getPartnerSlotOptions(), p.partnerSlot || '');
+    const coupleSelectHtml = buildSelectOptions(getCoupleOptions(), p.couple || '');
+    const unpairSelectHtml = buildSelectOptions(getUnpairOptions(), getUnpairSelectValue(p));
 
     row.innerHTML = `
       <div class="admin-row admin-row--draggable" draggable="true" data-player-index="${idx}">
-        <div class="admin-left"><span class="drag-handle" aria-hidden="true">::</span><strong class="admin-player-name">${p.name}</strong></div>
+        <div class="admin-left"><span class="drag-handle" aria-hidden="true">::</span><div class="admin-player-copy"><strong class="admin-player-name">${p.name}</strong><div class="admin-player-meta">${ratingSummary}</div></div></div>
         <div class="admin-actions">
           <div class="admin-edit">
             <button draggable="false" class="btn btn-sm btn-outline-secondary" data-idx="${idx}" data-action="edit">Edit</button>
           </div>
           <div class="admin-right">
             <button draggable="false" class="btn btn-sm gender-btn ${p.gender === 'female' ? 'btn-female' : 'btn-male'}" data-idx="${idx}" data-action="toggleGender">${genderLabel}</button>
-            <button draggable="false" class="btn btn-sm btn-level" data-idx="${idx}" data-action="toggleLevel">L${p.level}</button>
+            <input draggable="false" class="form-control form-control-sm admin-level-input" type="number" min="1" max="10" value="${p.level}" data-idx="${idx}" data-action="setLevel" title="${levelTitle}" aria-label="Level for ${p.name}">
+            <button draggable="false" class="btn btn-sm btn-rating-reset" data-idx="${idx}" data-action="resetAccumulated" title="Reset accumulated rating for ${p.name}">RP</button>
             <button draggable="false" class="btn btn-sm ${readyBtnClass}" data-idx="${idx}" data-action="toggleReady">${readySymbol}</button>
             <button draggable="false" class="btn btn-sm ${prefClass} ms-1 prefer-btn" data-idx="${idx}" data-action="togglePrefer">${prefLabel}</button>
-            <button draggable="false" class="btn btn-sm partner-btn ms-2" data-idx="${idx}" data-action="partnerToggle">${partnerLabel}</button>
-            <button draggable="false" class="btn btn-sm ${coupleClass} ms-2" data-idx="${idx}" data-action="toggleType">${coupleLabel}</button>
-            <button draggable="false" class="btn btn-sm btn-uncouple ms-2" data-idx="${idx}" data-action="toggleUnpair">${unpairLabel}</button>
+            <select draggable="false" class="form-select form-select-sm admin-flag-select admin-partner-select ms-2" data-idx="${idx}" data-action="setPartner" aria-label="Partner for ${p.name}">${partnerSelectHtml}</select>
+            <select draggable="false" class="form-select form-select-sm admin-flag-select admin-couple-select ms-2" data-idx="${idx}" data-action="setCouple" aria-label="Couple for ${p.name}">${coupleSelectHtml}</select>
+            <select draggable="false" class="form-select form-select-sm admin-flag-select admin-unpair-select ms-2" data-idx="${idx}" data-action="setUnpair" aria-label="Unpair for ${p.name}">${unpairSelectHtml}</select>
             <button draggable="false" class="btn btn-sm uniform-btn btn-delete ms-2" data-idx="${idx}" data-action="delete">Del</button>
           </div>
         </div>
@@ -2082,45 +2804,81 @@ function renderAdminPlayers() {
     });
   });
 
-  box.querySelectorAll('button[data-action]').forEach(btn => {
-    btn.onclick = () => {
-      const idx = parseInt(btn.getAttribute('data-idx'));
-      const action = btn.getAttribute('data-action');
+  box.querySelectorAll('[data-action]').forEach(control => {
+    const action = control.getAttribute('data-action');
+
+    if (action === 'setLevel') {
+      control.onchange = () => {
+        const idx = parseInt(control.getAttribute('data-idx'));
+        const player = players[idx];
+        if (!player) return;
+
+        const previousLevel = Number.isFinite(Number(player.level)) ? Number(player.level) : 1;
+        const parsedLevel = parseInt(control.value, 10);
+        const nextLevel = clampNumber(Number.isFinite(parsedLevel) ? parsedLevel : previousLevel, RATING_CONFIG.minLevel, RATING_CONFIG.maxLevel);
+        control.value = String(nextLevel);
+        if (nextLevel === previousLevel) return;
+
+        const previousAccumulated = getPlayerAccumulatedRating(player);
+        const message = `Change ${player.name} from L${previousLevel} to L${nextLevel}?\nCurrent accumulated rating: ${formatSignedRating(previousAccumulated)}\n\nOK = keep accumulated rating on the new level.\nCancel = revert.`;
+        if (!confirm(message)) {
+          control.value = String(previousLevel);
+          return;
+        }
+
+        setPlayerLevelWithAccumulatedRating(player, nextLevel);
+        normalizePlayerPrefer(player);
+        saveState(); render(); renderAdminPlayers();
+      };
+      return;
+    }
+
+    if (action === 'setPartner' || action === 'setCouple' || action === 'setUnpair') {
+      control.onchange = () => {
+        const idx = parseInt(control.getAttribute('data-idx'));
+        const player = players[idx];
+        if (!player) return;
+        const value = control.value;
+
+        if (action === 'setPartner') {
+          setPlayerPartnerSlot(player, value);
+        } else if (action === 'setCouple') {
+          setPlayerCoupleValue(player, value);
+        } else if (action === 'setUnpair') {
+          setPlayerUnpairValue(player, value);
+        }
+
+        saveState(); render(); renderAdminPlayers();
+      };
+      return;
+    }
+
+    control.onclick = () => {
+      const idx = parseInt(control.getAttribute('data-idx'));
+      const action = control.getAttribute('data-action');
 
       if (action === 'toggleReady') {
-        players[idx].ready = !players[idx].ready;
-        saveState(); updateIdlePlayers(); render(); renderAdminPlayers();
+        const player = players[idx];
+        player.ready = !player.ready;
+        if (!player.ready) handleQueuedPlayerMarkedNotReady(player);
+        updateIdlePlayers();
+        saveState(); render(); renderAdminPlayers();
       } else if (action === 'toggleGender') {
         players[idx].gender = players[idx].gender === 'male' ? 'female' : 'male';
         saveState(); render(); renderAdminPlayers();
-      } else if (action === 'toggleLevel') {
-        players[idx].level = (players[idx].level % 10) + 1;
-        players[idx].rating = players[idx].level * 100;
-        normalizePlayerPrefer(players[idx]);
+      } else if (action === 'resetAccumulated') {
+        const player = players[idx];
+        const accumulated = getPlayerAccumulatedRating(player);
+        if (!accumulated) return;
+        const message = `Reset accumulated rating for ${player.name}?\nCurrent accumulated rating: ${formatSignedRating(accumulated)}\n\nThis keeps level L${player.level} and resets rating to ${levelBaseRating(player.level)}.`;
+        if (!confirm(message)) return;
+        resetPlayerAccumulatedRating(player);
         saveState(); render(); renderAdminPlayers();
       } else if (action === 'togglePrefer') {
         const current = getEffectivePrefer(players[idx]);
         const currentIndex = preferOrder.indexOf(current);
         players[idx].prefer = preferOrder[(currentIndex + 1 + preferOrder.length) % preferOrder.length];
         normalizePlayerPrefer(players[idx]);
-        saveState(); render(); renderAdminPlayers();
-      } else if (action === 'partnerToggle') {
-        const order = ['', 'P1', 'P2', 'P3', 'P4', 'P5'];
-        const current = players[idx].partnerSlot || '';
-        const currentIndex = order.indexOf(current);
-        players[idx].partnerSlot = order[(currentIndex + 1 + order.length) % order.length] || null;
-        saveState(); render(); renderAdminPlayers();
-      } else if (action === 'toggleType') {
-        const current = players[idx].couple;
-        if (current === null || current === undefined) players[idx].couple = 1;
-        else if (current < MAX_COUPLE) players[idx].couple = current + 1;
-        else players[idx].couple = null;
-        saveState(); render(); renderAdminPlayers();
-      } else if (action === 'toggleUnpair') {
-        const current = players[idx].unpair;
-        if (current === null || current === undefined) players[idx].unpair = 1;
-        else if (current < MAX_COUPLE) players[idx].unpair = current + 1;
-        else players[idx].unpair = null;
         saveState(); render(); renderAdminPlayers();
       } else if (action === 'delete') {
         if (confirm('Delete player ' + players[idx].name + '?')) {
@@ -2130,7 +2888,11 @@ function renderAdminPlayers() {
       } else if (action === 'edit') {
         const newName = prompt('Edit name for ' + players[idx].name, players[idx].name);
         if (newName && newName.trim()) {
-          players[idx].name = newName.trim();
+          const player = players[idx];
+          const nextName = newName.trim();
+          if (!player || nextName === player.name) return;
+          player.name = nextName;
+          refreshHistoryNamesForPlayer(player);
           saveState(); updateIdlePlayers(); render(); renderAdminPlayers();
         }
       }
@@ -2143,6 +2905,7 @@ function renderAdminPlayers() {
 function buildExportPlayerSnapshot(player) {
   normalizePlayerPrefer(player);
   return {
+    id: ensurePlayerId(player),
     name: player.name,
     level: player.level || 4,
     gender: player.gender || 'male',
@@ -2153,6 +2916,7 @@ function buildExportPlayerSnapshot(player) {
     idleIndex: Number.isFinite(Number(player.idleIndex)) ? Math.max(0, Math.floor(Number(player.idleIndex))) : 0,
     couple: player.couple === undefined ? null : player.couple,
     unpair: player.unpair === undefined ? null : player.unpair,
+    unpairMain: player.unpairMain === undefined ? false : !!player.unpairMain,
     partnerSlot: player.partnerSlot === undefined ? null : player.partnerSlot,
     recentTeammates: normalizeRecentHistory(player.recentTeammates),
     recentOpponents: normalizeRecentHistory(player.recentOpponents)
@@ -2181,33 +2945,36 @@ function exportJSON() {
   URL.revokeObjectURL(url);
 }
 
+function formatExportTimestamp(ts) {
+  try {
+    const d = ts ? new Date(ts) : new Date();
+    // Convert moment to UTC+7 by adding 7 hours to the timestamp
+    const tzOffsetHours = 7;
+    const target = new Date(d.getTime() + tzOffsetHours * 3600000);
+    const dd = String(target.getUTCDate()).padStart(2, '0');
+    const mm = String(target.getUTCMonth() + 1).padStart(2, '0');
+    const yyyy = target.getUTCFullYear();
+    const hh = String(target.getUTCHours()).padStart(2, '0');
+    const min = String(target.getUTCMinutes()).padStart(2, '0');
+    return `${dd}-${mm}-${yyyy} ${hh}:${min}`;
+  } catch (e) {
+    return ts || '';
+  }
+}
+
 function importJSON(text) {
   try {
     const state = JSON.parse(text);
     if (state.players) {
-      players = state.players.map(p => ({
-        name: p.name,
-        level: p.level || 4,
-        gender: p.gender || 'male',
-        prefer: p.prefer || 'normal',
-        rating: p.rating !== undefined ? p.rating : ((p.level || 4) * 100),
-        matches: p.matches || 0,
-        ready: p.ready === undefined ? true : p.ready,
-        idleIndex: Number.isFinite(Number(p.idleIndex)) ? Math.max(0, Math.floor(Number(p.idleIndex))) : 0,
-        couple: p.couple === undefined ? null : p.couple,
-        unpair: p.unpair === undefined ? (p.uncouple === undefined ? null : p.uncouple) : p.unpair,
-        partnerSlot: p.partnerSlot === undefined ? null : p.partnerSlot,
-        recentTeammates: normalizeRecentHistory(p.recentTeammates),
-        recentOpponents: normalizeRecentHistory(p.recentOpponents)
-      }));
+      players = state.players.map(normalizePlayerRecord);
+      finalizePlayerRecords(players);
     }
-    
-    const byName = name => players.find(p => p.name === name);
+    const byRef = ref => findPlayerByRef(ref, players);
     
     if (state.active_matches) {
       active_matches = state.active_matches.map(m => {
         if (!m) return null;
-        return [[byName(m[0][0]), byName(m[0][1])], [byName(m[1][0]), byName(m[1][1])]];
+        return [[byRef(m[0][0]), byRef(m[0][1])], [byRef(m[1][0]), byRef(m[1][1])]];
       });
       while (active_matches.length < COURTS) active_matches.push(null);
     }
@@ -2215,15 +2982,15 @@ function importJSON(text) {
     if (state.queue_matches) {
       queue_matches = state.queue_matches.map(m => {
         if (!m) return null;
-        return [[byName(m[0][0]), byName(m[0][1])], [byName(m[1][0]), byName(m[1][1])]];
+        return [[byRef(m[0][0]), byRef(m[0][1])], [byRef(m[1][0]), byRef(m[1][1])]];
       }).filter(x => x);
     }
     
     if (state.idle_players) {
-      idle_players = state.idle_players.map(n => byName(n)).filter(x => x);
+      idle_players = state.idle_players.map(ref => byRef(ref)).filter(x => x);
     }
     
-    if (state.match_history) match_history = state.match_history;
+    if (state.match_history) match_history = finalizeHistoryEntries(state.match_history, players);
     
     saveState();
     updateIdlePlayers();
@@ -2240,14 +3007,203 @@ function resetAll() {
 }
 
 function downloadHistory() {
-  const lines = match_history.map(m => {
-    if (m.note) return `[${m.ts}] ${m.note}`;
-    const t1 = m.team1.join(' + ');
-    const t2 = m.team2.join(' + ');
-    const winStr = m.winnerTeam ? (m.winnerTeam === 1 ? '(T1 win)' : '(T2 win)') : '';
-    return `[${m.ts}] ${t1} vs ${t2} ${winStr}`;
+  const historyForExport = finalizeHistoryEntries(match_history, players);
+  const exportEntries = historyForExport.map(m => {
+    const ts = formatExportTimestamp(m && m.ts);
+    if (m && m.note) {
+      return {
+        prefix: `[${ts}] ${m.note}`,
+        ratingSummary: ''
+      };
+    }
+    const t1 = (m && m.team1) ? m.team1.join(' + ') : '';
+    const t2 = (m && m.team2) ? m.team2.join(' + ') : '';
+    const winStr = m && m.winnerTeam ? (m.winnerTeam === 1 ? '(T1 win)' : '(T2 win)') : '';
+    const ratingSummary = formatHistoryRatingUpdates(m);
+    return {
+      prefix: `[${ts}] ${t1} vs ${t2} ${winStr}`.trimEnd(),
+      ratingSummary
+    };
   });
-  const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+  const ratingColumnWidth = exportEntries.reduce((maxWidth, entry) => {
+    if (!entry?.ratingSummary) return maxWidth;
+    return Math.max(maxWidth, (entry.prefix || '').length);
+  }, 0);
+  const lines = exportEntries.map(entry => {
+    if (!entry?.ratingSummary) return entry?.prefix || '';
+    return `${(entry.prefix || '').padEnd(ratingColumnWidth, ' ')} | R: ${entry.ratingSummary}`;
+  });
+
+  // --- Build mini-report ---
+  const reportLines = [];
+  reportLines.push('');
+  reportLines.push('--- BÁO CÁO TÓM TẮT ---');
+  reportLines.push(`Total set: ${historyForExport.length}`);
+
+  // Group history into non-overlapping groups of 3 (in chronological order)
+  const sorted = historyForExport.slice().filter(m => m && m.ts).sort((a, b) => new Date(a.ts) - new Date(b.ts));
+  const groups = [];
+  for (let i = 0; i < sorted.length; i += 3) {
+    groups.push(sorted.slice(i, i + 3));
+  }
+
+  // Compute intervals (minutes) between group starts
+  const groupStarts = groups.map(g => (g && g[0] && g[0].ts) ? new Date(g[0].ts) : null).filter(Boolean);
+  const intervals = [];
+  for (let i = 1; i < groupStarts.length; i++) {
+    const deltaMin = Math.round((groupStarts[i] - groupStarts[i - 1]) / 60000);
+    intervals.push(deltaMin);
+  }
+  const avgInterval = intervals.length ? Math.round(intervals.reduce((a, b) => a + b, 0) / intervals.length) : 0;
+  reportLines.push(`Trung bình mỗi set = ${avgInterval} phút`);
+
+  // Detail per-group intervals
+  const maxGroupIndexWidth = String(groups.length).length;
+  const intervalLabels = intervals.map((_, i) => {
+    const leftIndex = String(i + 1).padStart(maxGroupIndexWidth, ' ');
+    const rightIndex = String(i + 2).padStart(maxGroupIndexWidth, ' ');
+    return `Nhóm ${leftIndex} -> Nhóm ${rightIndex}:`;
+  });
+  const maxIntervalLabelWidth = intervalLabels.reduce((maxWidth, label) => Math.max(maxWidth, label.length), 0);
+  const maxIntervalValueWidth = intervals.reduce((maxWidth, value) => Math.max(maxWidth, String(value).length), 0);
+  for (let i = 0; i < intervals.length; i++) {
+    const g1 = groups[i];
+    const g2 = groups[i + 1];
+    const t1 = g1 && g1[0] && g1[0].ts ? formatExportTimestamp(g1[0].ts) : 'n/a';
+    const t2 = g2 && g2[0] && g2[0].ts ? formatExportTimestamp(g2[0].ts) : 'n/a';
+    const labelText = intervalLabels[i].padEnd(maxIntervalLabelWidth, ' ');
+    const intervalText = String(intervals[i]).padStart(maxIntervalValueWidth, ' ');
+    reportLines.push(`${labelText} ${intervalText} phút (${t1} -> ${t2})`);
+  }
+
+  // Player statistics
+  const levelMap = new Map((players || []).map(p => [getPlayerRef(p), p.level || 0]));
+  const stats = new Map();
+  for (const m of historyForExport || []) {
+    if (!m || !m.team1 || !m.team2) continue;
+    const teams = [getHistoryTeamRefs(m, 'team1'), getHistoryTeamRefs(m, 'team2')];
+    for (let ti = 0; ti < 2; ti++) {
+      const team = teams[ti];
+      const opp = teams[1 - ti];
+      for (const ref of team) {
+        if (!ref) continue;
+        if (!stats.has(ref)) stats.set(ref, { sets: 0, teammates: {}, opponents: {}, ge: 0, lt: 0 });
+        const s = stats.get(ref);
+        s.sets++;
+        team.filter(other => other && other !== ref).forEach(other => {
+          const teammateName = getPlayerNameByRef(other);
+          s.teammates[teammateName] = (s.teammates[teammateName] || 0) + 1;
+        });
+        opp.filter(other => other).forEach(other => {
+          const opponentName = getPlayerNameByRef(other);
+          s.opponents[opponentName] = (s.opponents[opponentName] || 0) + 1;
+        });
+        const lvl = levelMap.get(ref);
+        if (lvl !== undefined) {
+          const oppAvg = opp.reduce((acc, other) => acc + (levelMap.get(other) || 0), 0) / opp.length;
+          if (lvl >= Math.floor(oppAvg)) s.ge++; else s.lt++;
+        }
+      }
+    }
+  }
+
+  reportLines.push('');
+  reportLines.push('Player set:');
+  const playerStatEntries = Array.from(stats.entries()).map(([ref, s]) => {
+    const name = getPlayerNameByRef(ref, ref);
+    const teammateCounts = Object.values(s.teammates);
+    const opponentCounts = Object.values(s.opponents);
+    return {
+      name,
+      sets: s.sets,
+      repeatedTeammates: teammateCounts.reduce((sum, count) => sum + Math.max(0, count - 1), 0),
+      uniqueTeammates: teammateCounts.length,
+      repeatedOpponents: opponentCounts.reduce((sum, count) => sum + Math.max(0, count - 1), 0),
+      uniqueOpponents: opponentCounts.length,
+      ge: s.ge,
+      lt: s.lt
+    };
+  });
+  const maxPlayerNameWidth = playerStatEntries.reduce((maxWidth, entry) => Math.max(maxWidth, entry.name.length), 0);
+  const maxSetWidth = playerStatEntries.reduce((maxWidth, entry) => Math.max(maxWidth, String(entry.sets).length), 0);
+  const maxRepeatedTeammatesWidth = playerStatEntries.reduce((maxWidth, entry) => Math.max(maxWidth, String(entry.repeatedTeammates).length), 0);
+  const maxUniqueTeammatesWidth = playerStatEntries.reduce((maxWidth, entry) => Math.max(maxWidth, String(entry.uniqueTeammates).length), 0);
+  const maxRepeatedOpponentsWidth = playerStatEntries.reduce((maxWidth, entry) => Math.max(maxWidth, String(entry.repeatedOpponents).length), 0);
+  const maxUniqueOpponentsWidth = playerStatEntries.reduce((maxWidth, entry) => Math.max(maxWidth, String(entry.uniqueOpponents).length), 0);
+  const maxGeWidth = playerStatEntries.reduce((maxWidth, entry) => Math.max(maxWidth, String(entry.ge).length), 0);
+  const maxLtWidth = playerStatEntries.reduce((maxWidth, entry) => Math.max(maxWidth, String(entry.lt).length), 0);
+  for (const [ref, s] of stats) {
+    const name = getPlayerNameByRef(ref, ref);
+    const teammateCounts = Object.values(s.teammates);
+    const opponentCounts = Object.values(s.opponents);
+    const uniqueTeammates = teammateCounts.length;
+    const uniqueOpponents = opponentCounts.length;
+    const repeatedTeammates = teammateCounts.reduce((sum, count) => sum + Math.max(0, count - 1), 0);
+    const repeatedOpponents = opponentCounts.reduce((sum, count) => sum + Math.max(0, count - 1), 0);
+    const nameText = name.padEnd(maxPlayerNameWidth, ' ');
+    const setText = String(s.sets).padStart(maxSetWidth, ' ');
+    const repeatedTeammatesText = String(repeatedTeammates).padStart(maxRepeatedTeammatesWidth, ' ');
+    const uniqueTeammatesText = String(uniqueTeammates).padStart(maxUniqueTeammatesWidth, ' ');
+    const repeatedOpponentsText = String(repeatedOpponents).padStart(maxRepeatedOpponentsWidth, ' ');
+    const uniqueOpponentsText = String(uniqueOpponents).padStart(maxUniqueOpponentsWidth, ' ');
+    const geText = String(s.ge).padStart(maxGeWidth, ' ');
+    const ltText = String(s.lt).padStart(maxLtWidth, ' ');
+    reportLines.push(`${nameText}: ${setText} set, đồng đội = {lặp lại = ${repeatedTeammatesText}, khác nhau = ${uniqueTeammatesText}}, đối thủ = {lặp lại = ${repeatedOpponentsText}, khác nhau = ${uniqueOpponentsText}}, số trận ngang lv trở lên = ${geText}, số trận dưới lv = ${ltText}`);
+  }
+
+  reportLines.push('');
+  reportLines.push('Rating/Elo:');
+  const ratingSummaryPlayers = (players || []).slice().sort((a, b) => {
+    const ratingDiff = Math.round(getPlayerRating(b)) - Math.round(getPlayerRating(a));
+    if (ratingDiff !== 0) return ratingDiff;
+    return (a.name || '').localeCompare(b.name || '');
+  });
+  const maxRatingNameLength = ratingSummaryPlayers.reduce((maxLength, player) => {
+    return Math.max(maxLength, (player?.name || '').length);
+  }, 0);
+  const maxRatingWidth = ratingSummaryPlayers.reduce((maxWidth, player) => {
+    return Math.max(maxWidth, String(Math.round(getPlayerRating(player))).length);
+  }, 0);
+  const maxLevelWidth = ratingSummaryPlayers.reduce((maxWidth, player) => {
+    return Math.max(maxWidth, String(player?.level ?? '').length);
+  }, 0);
+  const maxAccumulatedWidth = ratingSummaryPlayers.reduce((maxWidth, player) => {
+    return Math.max(maxWidth, formatSignedRating(getPlayerAccumulatedRating(player)).length);
+  }, 0);
+  ratingSummaryPlayers.forEach(player => {
+    const nameText = (player.name || '').padEnd(maxRatingNameLength, ' ');
+    const ratingText = String(Math.round(getPlayerRating(player))).padStart(maxRatingWidth, ' ');
+    const levelText = String(player.level).padStart(maxLevelWidth, ' ');
+    const accumulatedText = formatSignedRating(getPlayerAccumulatedRating(player)).padStart(maxAccumulatedWidth, ' ');
+    reportLines.push(`${nameText}: R=${ratingText}, L=${levelText}, tích lũy=${accumulatedText}`);
+  });
+
+  const dividerWidth = Math.max(
+    80,
+    ...[...lines, ...reportLines]
+      .filter(line => typeof line === 'string' && line.length > 0)
+      .map(line => line.length)
+  );
+  const sectionDivider = '-'.repeat(dividerWidth);
+  const sectionTitles = new Set(['--- BÁO CÁO TÓM TẮT ---', 'Player set:', 'Rating/Elo:']);
+  const formattedReportLines = [];
+
+  reportLines.forEach(line => {
+    if (line === '') {
+      if (formattedReportLines[formattedReportLines.length - 1] !== '') formattedReportLines.push('');
+      return;
+    }
+
+    if (sectionTitles.has(line)) {
+      if (formattedReportLines[formattedReportLines.length - 1] !== '') formattedReportLines.push('');
+      formattedReportLines.push(sectionDivider);
+      formattedReportLines.push('');
+    }
+
+    formattedReportLines.push(line);
+  });
+
+  const blob = new Blob([lines.join('\n') + '\n\n' + formattedReportLines.join('\n')], { type: 'text/plain' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -2274,6 +3230,7 @@ function startApp() {
   while (active_matches.length < COURTS) active_matches.push(null);
   updateIdlePlayers();
   render();
+  renderLevelSyncControl();
   renderAdminPlayers();
 }
 
@@ -2437,6 +3394,15 @@ if (document.getElementById('rebuildMatches')) {
     modal.show();
   };
 }
+if (document.getElementById('toggleLevelSync')) {
+  document.getElementById('toggleLevelSync').onclick = () => {
+    const nextState = !autoSyncLevelsFromRating;
+    setAutoSyncLevelsFromRating(nextState, { save: false, syncAll: nextState });
+    saveState();
+    render();
+    renderAdminPlayers();
+  };
+}
 if (document.getElementById('downloadHistory')) document.getElementById('downloadHistory').onclick = downloadHistory;
 if (document.getElementById('clearHistory')) document.getElementById('clearHistory').onclick = clearHistory;
 
@@ -2458,21 +3424,22 @@ function handleAddPlayer(event) {
   const gender = genderInput.value || 'male';
   const prefer = preferInput.value || 'normal';
 
-  const player = {
+  const player = normalizePlayerRecord({
     name,
     level,
     gender,
     prefer,
-    rating: level * 100,
+    rating: levelBaseRating(level),
     matches: 0,
     ready: true,
     idleIndex: 0,
     couple: null,
     unpair: null,
+    unpairMain: false,
     partnerSlot: null,
     recentTeammates: [],
     recentOpponents: []
-  };
+  });
   normalizePlayerPrefer(player);
   players.push(player);
 

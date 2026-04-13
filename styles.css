@@ -1,4 +1,19 @@
 body { font-size: 14px; }
+.top-header-actions {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+}
+
+.top-header-sync {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	gap: 2px;
+}
+
 .card-player { min-width: 120px; }
 .court-card { margin-bottom: 12px; }
 /* Show courts in reverse DOM order so Sân 12 appears on top */
@@ -24,6 +39,7 @@ body { font-size: 14px; }
 
 /* Empty slot that spans the three team columns and centers its text */
 .empty-slot{ grid-column: 1 / 4; display:flex; align-items:center; justify-content:center; min-height:56px; font-size:20px; color:rgba(0,0,0,0.7); }
+.empty-slot-off{ background:#f3f4f6; color:#6c757d; font-size:16px; font-weight:700; }
 .player-drop-slot{
 	display:inline-flex;
 	align-items:center;
@@ -59,7 +75,63 @@ body { font-size: 14px; }
 .btn-male { background-color: #cfe3ff !important; color: #000 !important; }
 .btn-female { background-color: #ffd6ec !important; color: #000 !important; }
 .btn-level { background-color: #fdcc3a !important; color: #000 !important; }
+.admin-level-input {
+	background-color: #fdcc3a !important;
+	color: #000 !important;
+	border: none !important;
+	text-align: center;
+	font-weight: 600;
+	padding-left: 0.25rem !important;
+	padding-right: 0.25rem !important;
+}
+.btn-rating-reset { background-color: #495057 !important; color: #fff !important; }
 .btn-enter-score { background-color: #28a745 !important; color: #fff !important; }
+.court-switch {
+	appearance: none;
+	-webkit-appearance: none;
+	border: none;
+	background: transparent;
+	padding: 0;
+	width: 52px;
+	height: 30px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+}
+
+.court-switch-track {
+	position: relative;
+	width: 52px;
+	height: 30px;
+	border-radius: 999px;
+	background: #6c757d;
+	transition: background-color 160ms ease;
+	display: inline-flex;
+	align-items: center;
+	padding: 3px;
+	box-sizing: border-box;
+}
+
+.court-switch-thumb {
+	width: 24px;
+	height: 24px;
+	border-radius: 50%;
+	background: #fff;
+	box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+	transform: translateX(0);
+	transition: transform 160ms ease;
+}
+
+.court-switch-on .court-switch-track { background: #198754; }
+.court-switch-on .court-switch-thumb { transform: translateX(22px); }
+.court-switch-off .court-switch-track { background: #9aa0a6; }
+.court-switch:focus-visible { outline: 2px solid rgba(13, 110, 253, 0.45); outline-offset: 2px; border-radius: 999px; }
+
+.level-sync-toggle { min-width: 180px; }
+.level-sync-toggle-on { background-color: #198754 !important; color: #fff !important; }
+.level-sync-toggle-off { background-color: #dc3545 !important; color: #fff !important; }
+.level-sync-status { font-size: 12px; color: #6c757d; line-height: 1.35; text-align: right; }
 
 /* Prefer states */
 .prefer-chill { background-color: #c8facc !important; color: #064e14 !important; }
@@ -72,20 +144,28 @@ body { font-size: 14px; }
 .admin-row--dragging{ opacity: 0.45; }
 .admin-row--dragover{ background-color: #eef6ff; outline: 1px dashed #7aa7d9; }
 .admin-left{ display:flex; align-items:center; gap:4px; min-width:0; overflow:hidden; padding-right:4px; }
+.admin-player-copy{ display:flex; flex-direction:column; min-width:0; }
 .admin-player-name{ display:inline-block; min-width:0; max-width:100%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.admin-player-meta{ font-size:11px; color:#6c757d; line-height:1.2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .drag-handle{ display:inline-flex; align-items:center; justify-content:center; min-width:16px; color:#6c757d; font-weight:700; letter-spacing:1px; user-select:none; }
 .admin-actions{ display:flex; align-items:center; gap:10px; flex:0 0 auto; white-space:nowrap; }
 .admin-edit{ display:flex; align-items:center; justify-content:center; flex: 0 0 60px; }
 .admin-right{ display:flex; align-items:center; gap:6px; flex: 0 0 auto; }
 .admin-right .btn{ min-width:48px; }
+.admin-right .form-select{ padding-top: 0.25rem; padding-bottom: 0.25rem; }
 /* Ensure admin-right buttons have exact widths matching header spans */
 .admin-right .gender-btn{ width:96px !important; }
 .admin-right .btn-level{ width:48px !important; }
+.admin-right .admin-level-input{ width:56px !important; min-width:56px !important; }
+.admin-right .btn-rating-reset{ width:48px !important; }
 .admin-right .btn-ready, .admin-right .btn-notready{ width:48px !important; }
 .admin-right .prefer-btn{ width:96px !important; }
+.admin-right .admin-partner-select{ width:100px !important; min-width:100px !important; }
+.admin-right .admin-couple-select{ width:72px !important; min-width:72px !important; }
+.admin-right .admin-unpair-select{ width:118px !important; min-width:118px !important; }
 .admin-right .btn-single, .admin-right .btn-info{ width:72px !important; }
 .admin-right .btn-delete{ width:56px !important; }
-.admin-right .btn-uncouple{ width:72px !important; }
+.admin-right .btn-uncouple{ width:102px !important; }
 
 /* controls placed at top-right of Players admin to free player-area space */
 .admin-top-controls{ display:flex; gap:8px; align-items:center; }
@@ -141,6 +221,8 @@ body { font-size: 14px; }
 
 /* make admin player rows responsive on small screens to avoid overlap */
 @media (max-width: 767.98px){
+	.top-header-actions { width: 100%; justify-content: flex-start; }
+	.top-header-sync { align-items: flex-start; }
 	.add-player-form{ grid-template-columns: 1fr; }
 	.add-player-form .fp-add{ justify-content:stretch; }
 	.add-player-form .fp-add .btn{ width:100%; }
@@ -150,6 +232,9 @@ body { font-size: 14px; }
 	.admin-edit{ justify-content:flex-start; flex:0 0 auto; }
 	.admin-right{ width:100%; display:flex; flex-wrap:wrap; gap:6px; }
 	.admin-right .btn{ min-width:0; flex: 1 1 auto; }
+	.admin-right .admin-partner-select,
+	.admin-right .admin-couple-select,
+	.admin-right .admin-unpair-select{ width:auto !important; min-width:72px !important; }
 	/* prefer button should still visually align but allow wrapping */
 	.prefer-btn{ width:auto !important; min-width:72px; }
 	.gender-btn{ width:auto !important; min-width:72px; }
@@ -167,6 +252,31 @@ body { font-size: 14px; }
 
 /* Delete button style aligned with uniform buttons but slightly muted */
 .btn-delete { background-color: #6c757d !important; color: #fff !important; }
+
+.admin-flag-select {
+	border: none !important;
+	box-shadow: none !important;
+	font-size: 12px !important;
+	font-weight: 500;
+	text-align: center;
+	text-align-last: center;
+	padding-right: 1.5rem !important;
+}
+
+.admin-partner-select {
+	background-color: #0d6efd !important;
+	color: #fff !important;
+}
+
+.admin-couple-select {
+	background-color: #0dcaf0 !important;
+	color: #fff !important;
+}
+
+.admin-unpair-select {
+	background-color: #dc3545 !important;
+	color: #fff !important;
+}
 
 /* Single button: neutral background but black text */
 .btn-single { background-color: #0dcaf0 !important; color: hsl(0, 0%, 100%) !important; border: none !important; }
